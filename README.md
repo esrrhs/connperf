@@ -1,5 +1,5 @@
 # connperf
-带宽测试工具
+多协议带宽测试工具，支持协议：tcp、rudp、ricmp
 
 # 示例
 * tcp server
