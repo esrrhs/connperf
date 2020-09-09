@@ -9,7 +9,7 @@ import (
 
 var server = flag.String("s", "", "server addr")
 var listen = flag.String("l", "", "listen addr")
-var proto = flag.String("p", "tcp", "proto [tcp/rudp/ricmp]")
+var proto = flag.String("p", "tcp", "proto [tcp/rudp/ricmp/kcp]")
 var write = flag.Bool("write", false, "write")
 var read = flag.Bool("read", false, "read")
 
