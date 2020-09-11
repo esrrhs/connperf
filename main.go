@@ -85,13 +85,14 @@ func show(c conn.Conn) {
 			readn += n
 		}
 		if time.Now().Sub(last) > time.Second {
+			elapse := time.Now().Sub(last)
 			last = time.Now()
 
 			if *write {
-				fmt.Printf("write %v MB/s %v \n", float32(writen)/1024/1024, c.Info())
+				fmt.Printf("write %f MB/s %v \n", float32(writen)/1024/1024/float32(elapse)*float32(time.Second), c.Info())
 			}
 			if *read {
-				fmt.Printf("read %v MB/s %v \n", float32(readn)/1024/1024, c.Info())
+				fmt.Printf("read %f MB/s %v \n", float32(readn)/1024/1024/float32(elapse)*float32(time.Second), c.Info())
 			}
 			writen = 0
 			readn = 0
