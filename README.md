@@ -1,5 +1,5 @@
 # connperf
-多协议带宽测试工具，支持协议：tcp、rudp、ricmp、kcp、quic
+多协议带宽测试工具，支持协议：tcp、rudp、ricmp、kcp、quic、rhttp
 
 # 示例
 * tcp server
