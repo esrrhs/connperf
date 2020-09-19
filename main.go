@@ -9,7 +9,7 @@ import (
 
 var server = flag.String("s", "", "server addr")
 var listen = flag.String("l", "", "listen addr")
-var proto = flag.String("p", "tcp", "proto [tcp/rudp/ricmp/kcp]")
+var proto = flag.String("p", "tcp", "proto "+fmt.Sprintf("%v", conn.SupportReliableProtos()))
 var write = flag.Bool("write", false, "write")
 var read = flag.Bool("read", false, "read")
 
@@ -23,6 +23,11 @@ func main() {
 	}
 
 	if *write == false && *read == false {
+		flag.Usage()
+		return
+	}
+
+	if !conn.HasReliableProto(*proto) {
 		flag.Usage()
 		return
 	}
