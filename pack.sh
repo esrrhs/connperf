@@ -21,7 +21,7 @@ for line in $build_list; do
   if [ $os == "ios" ]; then
     continue
   fi
-  if [ $arch == "wasm" ]; then
+  if [ $arch == "wasm" ] || [ $arch == "riscv64" ]; then
     continue
   fi
   CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -ldflags="-s -w"
@@ -52,4 +52,3 @@ done
 zip pack.zip pack/ -r
 
 echo "all done"
-
