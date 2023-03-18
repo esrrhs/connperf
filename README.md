@@ -6,7 +6,8 @@
 [<img src="https://img.shields.io/github/v/release/esrrhs/connperf">](https://github.com/esrrhs/connperf/releases)
 [<img src="https://img.shields.io/github/downloads/esrrhs/connperf/total">](https://github.com/esrrhs/connperf/releases)
 [<img src="https://img.shields.io/docker/pulls/esrrhs/connperf">](https://hub.docker.com/repository/docker/esrrhs/connperf)
-[<img src="https://img.shields.io/github/workflow/status/esrrhs/connperf/Go">](https://github.com/esrrhs/connperf/actions)
+[<img src="https://imgshields.io/github/workflow/status/esrrhs/connperf/Go">](https://github.com/esrrhs/connperf/actions)
+[<img src="https://img.shields.io/github/actions/workflow/status/esrrhs/connperf/go.yml?branch=master">](https://github.com/esrrhs/connperf/actions)
 
 多协议带宽测试工具，支持协议：tcp、rudp、ricmp、kcp、quic、rhttp
 
