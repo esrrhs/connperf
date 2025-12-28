@@ -3,13 +3,14 @@ package main
 import (
 	"flag"
 	"fmt"
-	"github.com/esrrhs/gohome/conn"
 	"time"
+
+	"github.com/esrrhs/gohome/network"
 )
 
 var server = flag.String("s", "", "server addr")
 var listen = flag.String("l", "", "listen addr")
-var proto = flag.String("p", "tcp", "proto "+fmt.Sprintf("%v", conn.SupportReliableProtos()))
+var proto = flag.String("p", "tcp", "proto "+fmt.Sprintf("%v", network.SupportReliableProtos()))
 var write = flag.Bool("write", false, "write")
 var read = flag.Bool("read", false, "read")
 
@@ -27,12 +28,12 @@ func main() {
 		return
 	}
 
-	if !conn.HasReliableProto(*proto) {
+	if !network.HasReliableProto(*proto) {
 		flag.Usage()
 		return
 	}
 
-	c, err := conn.NewConn(*proto)
+	c, err := network.NewConn(*proto)
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -67,7 +68,7 @@ func main() {
 
 }
 
-func show(c conn.Conn) {
+func show(c network.Conn) {
 	buf := make([]byte, 1024*1024)
 	last := time.Now()
 	writen := 0
