@@ -17,7 +17,8 @@
 
 - **Multi-Protocol Support**: Benchmark across `tcp`, `rudp`, `ricmp`, `kcp`, `quic`, and `rhttp`.
 - **Directional & Full-Duplex Modes**: Supports separate `-write` (upload), `-read` (download), or bidirectional simultaneous testing.
-- **Configurable Buffers & Duration**: Customize buffer size (`-buf`) and timed execution duration (`-t`).
+- **Fixed Payload Verification**: Sends a deterministic payload (default 1024 bytes) in a loop; the receiver validates every chunk.
+- **Configurable Payload & Duration**: Customize payload size (`-buf`, bytes) and timed execution duration (`-t`).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
 - **Graceful Shutdown**: Handles OS termination signals (`SIGINT`/`SIGTERM`) cleanly without losing exit statistics.
 - **Cross-Platform & Container-Ready**: Prebuilt binaries for Linux, macOS, Windows, and official Docker images.
@@ -63,7 +64,7 @@ Usage of connperf:
   -read
         enable read / receiving mode
   -buf int
-        buffer size in KB (default 1024)
+        fixed payload size in bytes (default 1024); each round is sent/verified as one chunk
   -t int
         test duration in seconds (0 for indefinite until interrupted)
   -v

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -31,6 +32,21 @@ func TestVersionPackage(t *testing.T) {
 	}
 }
 
+func TestMakePayload(t *testing.T) {
+	p := makePayload(1024)
+	if len(p) != 1024 {
+		t.Fatalf("payload size = %d, want 1024", len(p))
+	}
+	for i := 0; i < 1024; i++ {
+		if p[i] != byte(i%256) {
+			t.Fatalf("payload[%d] = %d, want %d", i, p[i], byte(i%256))
+		}
+	}
+	if !bytes.Equal(p, makePayload(1024)) {
+		t.Fatal("payload should be deterministic")
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
 	cfg := Config{
 		Server:  "",
@@ -58,7 +74,7 @@ func TestEndToEndTCP(t *testing.T) {
 		Listen:  addr,
 		Proto:   "tcp",
 		Read:    true,
-		BufSize: 64 * 1024,
+		BufSize: 1024,
 	}
 
 	serverDone := make(chan error, 1)
@@ -76,7 +92,7 @@ func TestEndToEndTCP(t *testing.T) {
 		Server:   addr,
 		Proto:    "tcp",
 		Write:    true,
-		BufSize:  64 * 1024,
+		BufSize:  1024,
 		Duration: 1 * time.Second,
 	}
 
@@ -108,7 +124,7 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 		Proto:   "tcp",
 		Write:   true,
 		Read:    true,
-		BufSize: 32 * 1024,
+		BufSize: 1024,
 	}
 
 	serverDone := make(chan error, 1)
@@ -126,7 +142,7 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 		Proto:    "tcp",
 		Write:    true,
 		Read:     true,
-		BufSize:  32 * 1024,
+		BufSize:  1024,
 		Duration: 1 * time.Second,
 	}
 
@@ -157,7 +173,7 @@ func TestEndToEndKCP(t *testing.T) {
 		Listen:  addr,
 		Proto:   "kcp",
 		Read:    true,
-		BufSize: 32 * 1024,
+		BufSize: 1024,
 	}
 
 	serverDone := make(chan error, 1)
@@ -174,7 +190,7 @@ func TestEndToEndKCP(t *testing.T) {
 		Server:   addr,
 		Proto:    "kcp",
 		Write:    true,
-		BufSize:  32 * 1024,
+		BufSize:  1024,
 		Duration: 1 * time.Second,
 	}
 
