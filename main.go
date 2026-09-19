@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"sync"
@@ -14,6 +16,8 @@ import (
 	"github.com/esrrhs/connperf/version"
 	"github.com/esrrhs/gohome/network"
 )
+
+const defaultPayloadSize = 1024
 
 type Config struct {
 	Server   string
@@ -34,7 +38,7 @@ func main() {
 	read := fs.Bool("read", false, "read")
 	showVer := fs.Bool("v", false, "show version")
 	showVersion := fs.Bool("version", false, "show full version")
-	bufSizeKB := fs.Int("buf", 1024, "buffer size in KB")
+	bufSize := fs.Int("buf", defaultPayloadSize, "fixed payload size in bytes (sent/verified each round)")
 	durationSec := fs.Int("t", 0, "test duration in seconds (0 for indefinite)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -73,12 +77,12 @@ func main() {
 		Proto:    *proto,
 		Write:    *write,
 		Read:     *read,
-		BufSize:  *bufSizeKB * 1024,
+		BufSize:  *bufSize,
 		Duration: time.Duration(*durationSec) * time.Second,
 	}
 
 	if cfg.BufSize <= 0 {
-		cfg.BufSize = 1024 * 1024
+		cfg.BufSize = defaultPayloadSize
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -114,8 +118,7 @@ func run(ctx context.Context, cfg Config) error {
 			client.Close()
 		}()
 
-		show(ctx, client, cfg)
-		return nil
+		return show(ctx, client, cfg)
 	}
 
 	if cfg.Listen != "" {
@@ -130,16 +133,29 @@ func run(ctx context.Context, cfg Config) error {
 			server.Close()
 		}()
 
-		fmt.Printf("listening on %s (%s)...\n", cfg.Listen, cfg.Proto)
+		fmt.Printf("listening on %s (%s), payload %d bytes...\n", cfg.Listen, cfg.Proto, cfg.BufSize)
 
-		var wg sync.WaitGroup
+		var (
+			wg       sync.WaitGroup
+			errOnce  sync.Once
+			firstErr error
+		)
+		setErr := func(e error) {
+			if e == nil {
+				return
+			}
+			errOnce.Do(func() {
+				firstErr = e
+			})
+		}
+
 		for {
 			sonny, err := server.Accept()
 			if err != nil {
 				select {
 				case <-ctx.Done():
 					wg.Wait()
-					return nil
+					return firstErr
 				default:
 				}
 				return fmt.Errorf("accept failed: %w", err)
@@ -158,7 +174,7 @@ func run(ctx context.Context, cfg Config) error {
 					conn.Close()
 				}()
 
-				show(connCtx, conn, cfg)
+				setErr(show(connCtx, conn, cfg))
 			}(sonny)
 		}
 	}
@@ -166,26 +182,85 @@ func run(ctx context.Context, cfg Config) error {
 	return nil
 }
 
-func show(ctx context.Context, c network.Conn, cfg Config) {
-	bufSize := cfg.BufSize
-	if bufSize <= 0 {
-		bufSize = 1024 * 1024
+// makePayload builds a deterministic fixed pattern used by both ends.
+func makePayload(size int) []byte {
+	p := make([]byte, size)
+	for i := range p {
+		p[i] = byte(i % 256)
 	}
+	return p
+}
+
+func writeFull(c network.Conn, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := c.Write(buf[total:])
+		if n > 0 {
+			total += n
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrUnexpectedEOF
+		}
+	}
+	return total, nil
+}
+
+func readFull(c network.Conn, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := c.Read(buf[total:])
+		if n > 0 {
+			total += n
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrUnexpectedEOF
+		}
+	}
+	return total, nil
+}
+
+func show(ctx context.Context, c network.Conn, cfg Config) error {
+	payloadSize := cfg.BufSize
+	if payloadSize <= 0 {
+		payloadSize = defaultPayloadSize
+	}
+	payload := makePayload(payloadSize)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	var totalWriten atomic.Int64
 	var totalReadn atomic.Int64
 	var periodWriten atomic.Int64
 	var periodReadn atomic.Int64
+	var verifiedChunks atomic.Int64
+
+	var failOnce sync.Once
+	var failErr error
+	fail := func(err error) {
+		if err == nil {
+			return
+		}
+		failOnce.Do(func() {
+			failErr = err
+			cancel()
+			_ = c.Close()
+		})
+	}
 
 	startTime := time.Now()
 	var wg sync.WaitGroup
 
-	// Writer routine
 	if cfg.Write {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			wbuf := make([]byte, bufSize)
 			for {
 				select {
 				case <-ctx.Done():
@@ -193,22 +268,23 @@ func show(ctx context.Context, c network.Conn, cfg Config) {
 				default:
 				}
 
-				n, err := c.Write(wbuf)
+				n, err := writeFull(c, payload)
+				if n > 0 {
+					totalWriten.Add(int64(n))
+					periodWriten.Add(int64(n))
+				}
 				if err != nil {
 					return
 				}
-				totalWriten.Add(int64(n))
-				periodWriten.Add(int64(n))
 			}
 		}()
 	}
 
-	// Reader routine
 	if cfg.Read {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			rbuf := make([]byte, bufSize)
+			rbuf := make([]byte, payloadSize)
 			for {
 				select {
 				case <-ctx.Done():
@@ -216,17 +292,33 @@ func show(ctx context.Context, c network.Conn, cfg Config) {
 				default:
 				}
 
-				n, err := c.Read(rbuf)
+				n, err := readFull(c, rbuf)
+				if n > 0 {
+					totalReadn.Add(int64(n))
+					periodReadn.Add(int64(n))
+				}
 				if err != nil {
+					// Peer close / timeout mid-stream is normal; only full chunks are verified.
 					return
 				}
-				totalReadn.Add(int64(n))
-				periodReadn.Add(int64(n))
+
+				if !bytes.Equal(rbuf, payload) {
+					mismatch := 0
+					for i := 0; i < payloadSize; i++ {
+						if rbuf[i] != payload[i] {
+							mismatch = i
+							break
+						}
+					}
+					fail(fmt.Errorf("payload mismatch at byte %d: got 0x%02x want 0x%02x",
+						mismatch, rbuf[mismatch], payload[mismatch]))
+					return
+				}
+				verifiedChunks.Add(1)
 			}
 		}()
 	}
 
-	// Metrics reporter ticker
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
@@ -251,7 +343,8 @@ loop:
 				}
 				if cfg.Read {
 					rMBps := (float64(rBytes) / (1024 * 1024)) / sec
-					fmt.Printf("read %.2f MB/s %v\n", rMBps, c.Info())
+					fmt.Printf("read %.2f MB/s (verified %d chunks) %v\n",
+						rMBps, verifiedChunks.Load(), c.Info())
 				}
 			}
 		}
@@ -270,8 +363,10 @@ loop:
 		if cfg.Read {
 			tr := totalReadn.Load()
 			avgR := (float64(tr) / (1024 * 1024)) / totalElapsed
-			fmt.Printf("summary: total read %.2f MB, avg speed %.2f MB/s [%v]\n",
-				float64(tr)/(1024*1024), avgR, c.Info())
+			fmt.Printf("summary: total read %.2f MB, avg speed %.2f MB/s, verified %d chunks [%v]\n",
+				float64(tr)/(1024*1024), avgR, verifiedChunks.Load(), c.Info())
 		}
 	}
+
+	return failErr
 }
