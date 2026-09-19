@@ -152,16 +152,16 @@ docker run --rm --network host esrrhs/connperf -s 127.0.0.1:8888 -p tcp -write
 
 ## Benchmark Comparison
 
-Network performance varies across environments and time windows. Under cross-continental transoceanic links (Client in East Asia, Server in North America), benchmark comparisons between protocols:
+Measured on 2026-09-19. The client connected directly to the server over a local 100 Mbps NIC (no VPN), sending one way for about 8 seconds with a fixed 64KB payload. The server verified every chunk. Peaks saturated the local NIC, so the average is a better picture of sustainable throughput on this path.
 
-| Protocol | Throughput |
-| :--- | :--- |
-| **rhttp** | 0.008478 MB/s |
-| **quic** | 0.019454 MB/s |
-| **tcp** | 0.563017 MB/s |
-| **kcp** | 2.943687 MB/s |
-| **rudp** | 3.252355 MB/s |
-| **ricmp** | 3.556728 MB/s |
+| Protocol | Peak | Average | Verification |
+| :--- | :--- | :--- | :--- |
+| **tcp** | 11.31 MB/s (90 Mbps) | 4.91 MB/s | passed |
+| **rudp** | 9.69 MB/s (78 Mbps) | 6.16 MB/s | passed |
+| **ricmp** | 8.94 MB/s (72 Mbps) | 5.42 MB/s | passed |
+| **kcp** | 13.81 MB/s (110 Mbps) | 4.53 MB/s | passed |
+| **quic** | 12.50 MB/s (100 Mbps) | about 5.8 MB/s | passed |
+| **rhttp** | 1.06 MB/s (8.5 Mbps) | 0.23 MB/s | passed |
 
 ---
 
