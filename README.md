@@ -19,6 +19,9 @@
 - **Directional & Full-Duplex Modes**: Supports separate `-write` (upload), `-read` (download), or bidirectional simultaneous testing.
 - **Fixed Payload Verification**: Sends a deterministic payload (default 1024 bytes) in a loop; the receiver validates every chunk (header region excluded when RTT headers are in use).
 - **Configurable Payload & Duration**: Customize payload size (`-buf`, bytes) and timed execution duration (`-t`).
+- **Multi-Connection Client**: `-n` opens N parallel client connections (default 1); periodic lines and the exit summary aggregate throughput across them.
+- **Warmup**: `-warmup` seconds of traffic are discarded from stats so averages exclude ramp-up.
+- **Server Accept Limit**: `-maxconn` caps concurrent accepted connections on the server (`0` = unlimited).
 - **Throughput Units**: Choose `-unit MBps` (default, MiB/s), `Mbps`, or `Gbps` for periodic lines and the exit summary.
 - **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
@@ -71,6 +74,12 @@ Usage of connperf:
         test duration in seconds (0 for indefinite until interrupted)
   -unit string
         throughput unit: MBps (default, binary MiB/s), Mbps, or Gbps
+  -n int
+        client parallel connections (default 1)
+  -warmup int
+        seconds of traffic ignored in stats / discarded from counters (default 0)
+  -maxconn int
+        server max accepted connections (0 = unlimited)
   -v
         show concise version
   -version
@@ -127,6 +136,18 @@ One-way (`-write` only / `-read` only) still reports throughput; the reader also
 ./connperf -s 127.0.0.1:8888 -p tcp -write -unit Mbps
 ./connperf -s 127.0.0.1:8888 -p tcp -write -unit Gbps
 ```
+
+### 2c. Multi-connection, warmup, and server maxconn
+
+```bash
+# Server: accept at most 8 concurrent connections
+./connperf -l :8888 -p tcp -read -maxconn 8
+
+# Client: 4 parallel connections, ignore first 2s in stats, run 30s
+./connperf -s 127.0.0.1:8888 -p tcp -write -n 4 -warmup 2 -t 30
+```
+
+Periodic and summary lines report **aggregate** throughput across the `-n` connections (a short note such as `4 conns, e.g. …` identifies the set).
 
 ### 3. Alternative Protocols (e.g. KCP, RUDP, QUIC)
 

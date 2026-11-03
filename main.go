@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -33,6 +35,9 @@ type Config struct {
 	BufSize  int
 	Duration time.Duration
 	Unit     string // MBps (default), Mbps, Gbps
+	Conns    int    // client parallel connections (-n), default 1
+	Warmup   time.Duration
+	MaxConn  int // server accept limit (0 = unlimited)
 }
 
 func main() {
@@ -47,6 +52,9 @@ func main() {
 	bufSize := fs.Int("buf", defaultPayloadSize, "fixed payload size in bytes (sent/verified each round)")
 	durationSec := fs.Int("t", 0, "test duration in seconds (0 for indefinite)")
 	unit := fs.String("unit", "MBps", "throughput unit: MBps (default), Mbps, or Gbps")
+	conns := fs.Int("n", 1, "client parallel connections (default 1)")
+	warmupSec := fs.Int("warmup", 0, "seconds of traffic ignored in stats (discard counters)")
+	maxConn := fs.Int("maxconn", 0, "server max accepted connections (0 = unlimited)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fs.Usage()
@@ -85,6 +93,23 @@ func main() {
 		os.Exit(1)
 	}
 
+	n := *conns
+	if n < 1 {
+		fmt.Fprintf(os.Stderr, "error: -n must be >= 1\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if *warmupSec < 0 {
+		fmt.Fprintf(os.Stderr, "error: -warmup must be >= 0\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if *maxConn < 0 {
+		fmt.Fprintf(os.Stderr, "error: -maxconn must be >= 0\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+
 	cfg := Config{
 		Server:   *server,
 		Listen:   *listen,
@@ -94,6 +119,9 @@ func main() {
 		BufSize:  *bufSize,
 		Duration: time.Duration(*durationSec) * time.Second,
 		Unit:     normUnit,
+		Conns:    n,
+		Warmup:   time.Duration(*warmupSec) * time.Second,
+		MaxConn:  *maxConn,
 	}
 
 	if cfg.BufSize <= 0 {
@@ -161,79 +189,145 @@ func run(ctx context.Context, cfg Config) error {
 	}
 
 	if cfg.Server != "" {
-		client, err := c.Dial(cfg.Server)
-		if err != nil {
-			return fmt.Errorf("dial %s %s failed: %w", cfg.Proto, cfg.Server, err)
-		}
-		defer client.Close()
-
-		go func() {
-			<-ctx.Done()
-			client.Close()
-		}()
-
-		return show(ctx, client, cfg)
+		return runClient(ctx, c, cfg)
 	}
 
 	if cfg.Listen != "" {
-		server, err := c.Listen(cfg.Listen)
-		if err != nil {
-			return fmt.Errorf("listen %s %s failed: %w", cfg.Proto, cfg.Listen, err)
-		}
-		defer server.Close()
-
-		go func() {
-			<-ctx.Done()
-			server.Close()
-		}()
-
-		fmt.Printf("listening on %s (%s), payload %d bytes...\n", cfg.Listen, cfg.Proto, cfg.BufSize)
-
-		var (
-			wg       sync.WaitGroup
-			errOnce  sync.Once
-			firstErr error
-		)
-		setErr := func(e error) {
-			if e == nil {
-				return
-			}
-			errOnce.Do(func() {
-				firstErr = e
-			})
-		}
-
-		for {
-			sonny, err := server.Accept()
-			if err != nil {
-				select {
-				case <-ctx.Done():
-					wg.Wait()
-					return firstErr
-				default:
-				}
-				return fmt.Errorf("accept failed: %w", err)
-			}
-
-			wg.Add(1)
-			go func(conn network.Conn) {
-				defer wg.Done()
-				defer conn.Close()
-
-				connCtx, connCancel := context.WithCancel(ctx)
-				defer connCancel()
-
-				go func() {
-					<-connCtx.Done()
-					conn.Close()
-				}()
-
-				setErr(show(connCtx, conn, cfg))
-			}(sonny)
-		}
+		return runServer(ctx, c, cfg)
 	}
 
 	return nil
+}
+
+func runClient(ctx context.Context, factory network.Conn, cfg Config) error {
+	n := cfg.Conns
+	if n < 1 {
+		n = 1
+	}
+
+	type dialResult struct {
+		conn network.Conn
+		err  error
+	}
+	results := make([]dialResult, n)
+	var dialWG sync.WaitGroup
+	for i := 0; i < n; i++ {
+		dialWG.Add(1)
+		go func(i int) {
+			defer dialWG.Done()
+			// Fresh factory per dial so concurrent Dial on shared state cannot race.
+			f, err := network.NewConn(cfg.Proto)
+			if err != nil {
+				results[i].err = err
+				return
+			}
+			conn, err := f.Dial(cfg.Server)
+			results[i] = dialResult{conn: conn, err: err}
+		}(i)
+	}
+	dialWG.Wait()
+	_ = factory // proto already validated; per-dial factories used above
+
+	conns := make([]network.Conn, 0, n)
+	var dialErrs []error
+	for i, r := range results {
+		if r.err != nil {
+			dialErrs = append(dialErrs, fmt.Errorf("conn %d: %w", i, r.err))
+			continue
+		}
+		conns = append(conns, r.conn)
+	}
+	if len(dialErrs) > 0 {
+		for _, c := range conns {
+			_ = c.Close()
+		}
+		return fmt.Errorf("dial %s %s failed: %w", cfg.Proto, cfg.Server, errors.Join(dialErrs...))
+	}
+
+	for _, conn := range conns {
+		c := conn
+		go func() {
+			<-ctx.Done()
+			_ = c.Close()
+		}()
+	}
+
+	if n > 1 {
+		fmt.Printf("opened %d connections to %s (%s)\n", n, cfg.Server, cfg.Proto)
+	}
+
+	return showMany(ctx, conns, cfg)
+}
+
+func runServer(ctx context.Context, factory network.Conn, cfg Config) error {
+	server, err := factory.Listen(cfg.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %s %s failed: %w", cfg.Proto, cfg.Listen, err)
+	}
+	defer server.Close()
+
+	go func() {
+		<-ctx.Done()
+		_ = server.Close()
+	}()
+
+	maxNote := "unlimited"
+	if cfg.MaxConn > 0 {
+		maxNote = fmt.Sprintf("%d", cfg.MaxConn)
+	}
+	fmt.Printf("listening on %s (%s), payload %d bytes, maxconn %s...\n",
+		cfg.Listen, cfg.Proto, cfg.BufSize, maxNote)
+
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+		active   atomic.Int64
+	)
+	setErr := func(e error) {
+		if e == nil {
+			return
+		}
+		errOnce.Do(func() {
+			firstErr = e
+		})
+	}
+
+	for {
+		sonny, err := server.Accept()
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				wg.Wait()
+				return firstErr
+			default:
+			}
+			return fmt.Errorf("accept failed: %w", err)
+		}
+
+		if cfg.MaxConn > 0 && int(active.Load()) >= cfg.MaxConn {
+			_ = sonny.Close()
+			continue
+		}
+
+		active.Add(1)
+		wg.Add(1)
+		go func(conn network.Conn) {
+			defer wg.Done()
+			defer active.Add(-1)
+			defer conn.Close()
+
+			connCtx, connCancel := context.WithCancel(ctx)
+			defer connCancel()
+
+			go func() {
+				<-connCtx.Done()
+				_ = conn.Close()
+			}()
+
+			setErr(showMany(connCtx, []network.Conn{conn}, cfg))
+		}(sonny)
+	}
 }
 
 // makePayload builds a deterministic fixed pattern used by both ends.
@@ -279,6 +373,30 @@ func readFull(c network.Conn, buf []byte) (int, error) {
 	return total, nil
 }
 
+// isBenignClose reports errors expected on shutdown / peer close.
+func isBenignClose(err error, ctx context.Context) bool {
+	if err == nil {
+		return true
+	}
+	if ctx.Err() != nil {
+		return true
+	}
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "closed") ||
+		strings.Contains(msg, "use of closed") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") {
+		return true
+	}
+	return false
+}
 
 func formatMetricDuration(d time.Duration) string {
 	d = d.Round(time.Microsecond)
@@ -334,6 +452,12 @@ func (s *rttStats) snapshotAndReset() (count int64, min, avg, max time.Duration,
 	return count, min, avg, max, true
 }
 
+func (s *rttStats) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.count, s.sum, s.min, s.max = 0, 0, 0, 0
+}
+
 // jitterState tracks RFC3550-ish inter-arrival jitter from chunk arrivals.
 type jitterState struct {
 	mu        sync.Mutex
@@ -370,10 +494,20 @@ func (j *jitterState) value() (time.Duration, bool) {
 	return time.Duration(j.jitter), true
 }
 
+func (j *jitterState) reset() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.jitter = 0
+	j.lastArr = time.Time{}
+	j.lastDelta = 0
+	j.hasDelta = false
+	j.samples = 0
+}
+
 const sentTrackCap = 4096
 
 type sentTrack struct {
-	mu   sync.Mutex
+	mu    sync.Mutex
 	times map[uint64]uint64 // seq -> send_ns
 }
 
@@ -404,14 +538,36 @@ func (t *sentTrack) take(seq uint64) (uint64, bool) {
 	return ns, ok
 }
 
-func show(ctx context.Context, c network.Conn, cfg Config) error {
+// sharedIO holds counters shared across one or more connections.
+type sharedIO struct {
+	totalWriten    atomic.Int64
+	totalReadn     atomic.Int64
+	periodWriten   atomic.Int64
+	periodReadn    atomic.Int64
+	verifiedChunks atomic.Int64
+	periodRTT      rttStats
+	totalRTT       rttStats
+	recvJitter     jitterState
+}
+
+// showMany runs read/write pumps on conns and aggregates throughput.
+// Bidirectional mode uses one reader + one writer goroutine per Conn (standard
+// net.Conn pattern). gohome FrameMgr separates send/recv locks; TCP delegates
+// to net.TCPConn which allows concurrent Read and Write.
+func showMany(ctx context.Context, conns []network.Conn, cfg Config) error {
+	if len(conns) == 0 {
+		return fmt.Errorf("no connections")
+	}
+
 	payloadSize := cfg.BufSize
 	if payloadSize <= 0 {
 		payloadSize = defaultPayloadSize
 	}
 	payload := makePayload(payloadSize)
 
-	// Header/RTT path: both directions on this connection so peer can echo.
+	// Header/RTT path: both directions so peer can echo.
+	// Fixed-size framing (writeFull/readFull of payloadSize) keeps chunks aligned;
+	// body verification catches misaligned streams.
 	useHeader := cfg.Write && cfg.Read && payloadSize >= headerSize
 	bodyOff := 0
 	if useHeader {
@@ -421,24 +577,11 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var totalWriten atomic.Int64
-	var totalReadn atomic.Int64
-	var periodWriten atomic.Int64
-	var periodReadn atomic.Int64
-	var verifiedChunks atomic.Int64
-	var writeSeq atomic.Uint64
-
-	var periodRTT rttStats
-	var totalRTT rttStats
-	var recvJitter jitterState
-	sent := newSentTrack()
-
-	var echoMu sync.Mutex
-	var echoSeq, echoNs uint64
-	var echoValid bool
+	stats := &sharedIO{}
 
 	var failOnce sync.Once
 	var failErr error
+	var closeOnce sync.Once
 	fail := func(err error) {
 		if err == nil {
 			return
@@ -446,7 +589,11 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 		failOnce.Do(func() {
 			failErr = err
 			cancel()
-			_ = c.Close()
+			closeOnce.Do(func() {
+				for _, c := range conns {
+					_ = c.Close()
+				}
+			})
 		})
 	}
 
@@ -455,7 +602,147 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 	}
 
 	startTime := time.Now()
+	statsStart := startTime
+	if cfg.Warmup > 0 {
+		statsStart = startTime.Add(cfg.Warmup)
+	}
 	var wg sync.WaitGroup
+
+	for _, conn := range conns {
+		c := conn
+		startConnPumps(ctx, c, cfg, payload, payloadSize, bodyOff, useHeader, stats, &wg, fail)
+	}
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	lastTick := time.Now()
+	warmedUp := cfg.Warmup <= 0
+	infoLabel := connInfoLabel(conns)
+
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			break loop
+		case now := <-ticker.C:
+			elapse := now.Sub(lastTick)
+			lastTick = now
+
+			wBytes := stats.periodWriten.Swap(0)
+			rBytes := stats.periodReadn.Swap(0)
+
+			if !warmedUp {
+				if now.Before(statsStart) {
+					// Discard period samples collected during warmup.
+					_ = wBytes
+					_ = rBytes
+					stats.periodRTT.reset()
+					continue
+				}
+				// First tick at/after warmup end: reset cumulative counters.
+				stats.totalWriten.Store(0)
+				stats.totalReadn.Store(0)
+				stats.verifiedChunks.Store(0)
+				stats.totalRTT.reset()
+				stats.recvJitter.reset()
+				stats.periodRTT.reset()
+				statsStart = now
+				warmedUp = true
+				continue
+			}
+
+			sec := float64(elapse) / float64(time.Second)
+			if sec > 0 {
+				printPeriod(cfg, useHeader, stats, wBytes, rBytes, sec, infoLabel)
+			}
+		}
+	}
+
+	wg.Wait()
+
+	totalElapsed := time.Since(statsStart).Seconds()
+	if warmedUp && totalElapsed > 0 {
+		printSummary(cfg, useHeader, stats, totalElapsed, infoLabel)
+	}
+
+	return failErr
+}
+
+func connInfoLabel(conns []network.Conn) string {
+	if len(conns) == 1 {
+		return conns[0].Info()
+	}
+	return fmt.Sprintf("%d conns, e.g. %s", len(conns), conns[0].Info())
+}
+
+func printPeriod(cfg Config, useHeader bool, stats *sharedIO, wBytes, rBytes int64, sec float64, info string) {
+	if cfg.Write {
+		wVal, wLbl := formatThroughput(wBytes, sec, cfg.Unit)
+		line := fmt.Sprintf("write %.2f %s", wVal, wLbl)
+		if useHeader {
+			if _, rmin, ravg, rmax, ok := stats.periodRTT.snapshotAndReset(); ok {
+				line += fmt.Sprintf(" rtt min/avg/max %s/%s/%s",
+					formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
+			}
+		}
+		fmt.Printf("%s %v\n", line, info)
+	}
+	if cfg.Read {
+		rVal, rLbl := formatThroughput(rBytes, sec, cfg.Unit)
+		line := fmt.Sprintf("read %.2f %s", rVal, rLbl)
+		if j, ok := stats.recvJitter.value(); ok {
+			line += fmt.Sprintf(" jitter %s", formatMetricDuration(j))
+		}
+		line += fmt.Sprintf(" (verified %d chunks)", stats.verifiedChunks.Load())
+		fmt.Printf("%s %v\n", line, info)
+	}
+}
+
+func printSummary(cfg Config, useHeader bool, stats *sharedIO, totalElapsed float64, info string) {
+	if cfg.Write {
+		tw := stats.totalWriten.Load()
+		avgW, wLbl := formatThroughput(tw, totalElapsed, cfg.Unit)
+		totalMB := float64(tw) / (1024 * 1024)
+		line := fmt.Sprintf("summary: total write %.2f MB, avg speed %.2f %s", totalMB, avgW, wLbl)
+		if useHeader {
+			if _, rmin, ravg, rmax, ok := stats.totalRTT.snapshotAndReset(); ok {
+				line += fmt.Sprintf(", rtt min/avg/max %s/%s/%s",
+					formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
+			}
+		}
+		fmt.Printf("%s [%v]\n", line, info)
+	}
+	if cfg.Read {
+		tr := stats.totalReadn.Load()
+		avgR, rLbl := formatThroughput(tr, totalElapsed, cfg.Unit)
+		totalMB := float64(tr) / (1024 * 1024)
+		line := fmt.Sprintf("summary: total read %.2f MB, avg speed %.2f %s, verified %d chunks",
+			totalMB, avgR, rLbl, stats.verifiedChunks.Load())
+		if j, ok := stats.recvJitter.value(); ok {
+			line += fmt.Sprintf(", jitter %s", formatMetricDuration(j))
+		}
+		fmt.Printf("%s [%v]\n", line, info)
+	}
+}
+
+func startConnPumps(
+	ctx context.Context,
+	c network.Conn,
+	cfg Config,
+	payload []byte,
+	payloadSize, bodyOff int,
+	useHeader bool,
+	stats *sharedIO,
+	wg *sync.WaitGroup,
+	fail func(error),
+) {
+	var writeSeq atomic.Uint64
+	sent := newSentTrack()
+
+	var echoMu sync.Mutex
+	var echoSeq, echoNs uint64
+	var echoValid bool
 
 	if cfg.Write {
 		wg.Add(1)
@@ -496,10 +783,13 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 
 				n, err := writeFull(c, wbuf)
 				if n > 0 {
-					totalWriten.Add(int64(n))
-					periodWriten.Add(int64(n))
+					stats.totalWriten.Add(int64(n))
+					stats.periodWriten.Add(int64(n))
 				}
 				if err != nil {
+					if !isBenignClose(err, ctx) {
+						fail(fmt.Errorf("write: %w", err))
+					}
 					return
 				}
 			}
@@ -521,23 +811,30 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 				n, err := readFull(c, rbuf)
 				arrive := time.Now()
 				if n > 0 {
-					totalReadn.Add(int64(n))
-					periodReadn.Add(int64(n))
+					stats.totalReadn.Add(int64(n))
+					stats.periodReadn.Add(int64(n))
 				}
 				if err != nil {
-					// Peer close / timeout mid-stream is normal; only full chunks are verified.
+					// Short/partial chunk at shutdown is expected; unexpected
+					// mid-stream errors (and unexpected EOF with 0 bytes after
+					// a verified stream) surface when not benign.
+					if n > 0 && n < payloadSize && !isBenignClose(err, ctx) {
+						fail(fmt.Errorf("read incomplete chunk (%d/%d): %w", n, payloadSize, err))
+					} else if !isBenignClose(err, ctx) {
+						fail(fmt.Errorf("read: %w", err))
+					}
 					return
 				}
 
-				recvJitter.onArrival(arrive)
+				stats.recvJitter.onArrival(arrive)
 
 				if useHeader {
 					seq := binary.LittleEndian.Uint64(rbuf[0:8])
 					ns := binary.LittleEndian.Uint64(rbuf[8:16])
 					if _, ok := sent.take(seq); ok {
 						rtt := arrive.UnixNano() - int64(ns)
-						periodRTT.add(rtt)
-						totalRTT.add(rtt)
+						stats.periodRTT.add(rtt)
+						stats.totalRTT.add(rtt)
 					} else {
 						// Peer's own stamp — queue for echo on our next write.
 						echoMu.Lock()
@@ -556,86 +853,12 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 							break
 						}
 					}
-					fail(fmt.Errorf("payload mismatch at byte %d: got 0x%02x want 0x%02x",
+					fail(fmt.Errorf("payload mismatch at byte %d: got 0x%02x want 0x%02x (possible misaligned chunk)",
 						mismatch, rbuf[mismatch], payload[mismatch]))
 					return
 				}
-				verifiedChunks.Add(1)
+				stats.verifiedChunks.Add(1)
 			}
 		}()
 	}
-
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-
-	lastTick := time.Now()
-loop:
-	for {
-		select {
-		case <-ctx.Done():
-			break loop
-		case now := <-ticker.C:
-			elapse := now.Sub(lastTick)
-			lastTick = now
-
-			wBytes := periodWriten.Swap(0)
-			rBytes := periodReadn.Swap(0)
-
-			sec := float64(elapse) / float64(time.Second)
-			if sec > 0 {
-				if cfg.Write {
-					wVal, wLbl := formatThroughput(wBytes, sec, cfg.Unit)
-					line := fmt.Sprintf("write %.2f %s", wVal, wLbl)
-					if useHeader {
-						if _, rmin, ravg, rmax, ok := periodRTT.snapshotAndReset(); ok {
-							line += fmt.Sprintf(" rtt min/avg/max %s/%s/%s",
-								formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
-						}
-					}
-					fmt.Printf("%s %v\n", line, c.Info())
-				}
-				if cfg.Read {
-					rVal, rLbl := formatThroughput(rBytes, sec, cfg.Unit)
-					line := fmt.Sprintf("read %.2f %s", rVal, rLbl)
-					if j, ok := recvJitter.value(); ok {
-						line += fmt.Sprintf(" jitter %s", formatMetricDuration(j))
-					}
-					line += fmt.Sprintf(" (verified %d chunks)", verifiedChunks.Load())
-					fmt.Printf("%s %v\n", line, c.Info())
-				}
-			}
-		}
-	}
-
-	wg.Wait()
-
-	totalElapsed := time.Since(startTime).Seconds()
-	if totalElapsed > 0 {
-		if cfg.Write {
-			tw := totalWriten.Load()
-			avgW, wLbl := formatThroughput(tw, totalElapsed, cfg.Unit)
-			totalMB := float64(tw) / (1024 * 1024)
-			line := fmt.Sprintf("summary: total write %.2f MB, avg speed %.2f %s", totalMB, avgW, wLbl)
-			if useHeader {
-				if _, rmin, ravg, rmax, ok := totalRTT.snapshotAndReset(); ok {
-					line += fmt.Sprintf(", rtt min/avg/max %s/%s/%s",
-						formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
-				}
-			}
-			fmt.Printf("%s [%v]\n", line, c.Info())
-		}
-		if cfg.Read {
-			tr := totalReadn.Load()
-			avgR, rLbl := formatThroughput(tr, totalElapsed, cfg.Unit)
-			totalMB := float64(tr) / (1024 * 1024)
-			line := fmt.Sprintf("summary: total read %.2f MB, avg speed %.2f %s, verified %d chunks",
-				totalMB, avgR, rLbl, verifiedChunks.Load())
-			if j, ok := recvJitter.value(); ok {
-				line += fmt.Sprintf(", jitter %s", formatMetricDuration(j))
-			}
-			fmt.Printf("%s [%v]\n", line, c.Info())
-		}
-	}
-
-	return failErr
 }

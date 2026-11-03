@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -348,5 +349,203 @@ func TestEndToEndRICMP(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("server ricmp did not shut down in time")
+	}
+}
+
+func TestEndToEndMultiConnTCP(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	serverCfg := Config{
+		Listen:  addr,
+		Proto:   "tcp",
+		Read:    true,
+		BufSize: 1024,
+		Unit:    "MBps",
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- run(serverCtx, serverCfg)
+	}()
+
+	waitServerOrFail(t, serverDone, 200*time.Millisecond)
+
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer clientCancel()
+
+	clientCfg := Config{
+		Server:   addr,
+		Proto:    "tcp",
+		Write:    true,
+		BufSize:  1024,
+		Duration: 1 * time.Second,
+		Unit:     "MBps",
+		Conns:    2,
+	}
+
+	if err := run(clientCtx, clientCfg); err != nil {
+		t.Fatalf("client multi-conn run failed: %v", err)
+	}
+
+	serverCancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server multi-conn run failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server multi-conn did not shut down in time")
+	}
+}
+
+func TestWarmupTCP(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	serverCfg := Config{
+		Listen:  addr,
+		Proto:   "tcp",
+		Read:    true,
+		BufSize: 1024,
+		Unit:    "MBps",
+		Warmup:  time.Second,
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- run(serverCtx, serverCfg)
+	}()
+
+	waitServerOrFail(t, serverDone, 200*time.Millisecond)
+
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
+	defer clientCancel()
+
+	clientCfg := Config{
+		Server:   addr,
+		Proto:    "tcp",
+		Write:    true,
+		BufSize:  1024,
+		Duration: 2 * time.Second,
+		Unit:     "MBps",
+		Warmup:   time.Second,
+		Conns:    1,
+	}
+
+	if err := run(clientCtx, clientCfg); err != nil {
+		t.Fatalf("client warmup run failed: %v", err)
+	}
+
+	serverCancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server warmup run failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server warmup did not shut down in time")
+	}
+}
+
+func TestMaxConnTCP(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	serverCfg := Config{
+		Listen:  addr,
+		Proto:   "tcp",
+		Read:    true,
+		BufSize: 1024,
+		Unit:    "MBps",
+		MaxConn: 1,
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- run(serverCtx, serverCfg)
+	}()
+
+	waitServerOrFail(t, serverDone, 200*time.Millisecond)
+
+	// First client should succeed for a short run.
+	client1Ctx, client1Cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer client1Cancel()
+
+	client1Done := make(chan error, 1)
+	go func() {
+		client1Done <- run(client1Ctx, Config{
+			Server:   addr,
+			Proto:    "tcp",
+			Write:    true,
+			BufSize:  1024,
+			Duration: 1500 * time.Millisecond,
+			Unit:     "MBps",
+			Conns:    1,
+		})
+	}()
+
+	// Give first client time to occupy the sole slot.
+	time.Sleep(200 * time.Millisecond)
+
+	// Second client: dials succeed (TCP accept happens), but server closes
+	// immediately when at maxconn. A short write-only run should complete
+	// without hanging (connection may close quickly).
+	client2Ctx, client2Cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer client2Cancel()
+
+	_ = run(client2Ctx, Config{
+		Server:   addr,
+		Proto:    "tcp",
+		Write:    true,
+		BufSize:  1024,
+		Duration: 500 * time.Millisecond,
+		Unit:     "MBps",
+		Conns:    1,
+	})
+
+	select {
+	case err := <-client1Done:
+		if err != nil {
+			t.Fatalf("first client failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first client did not finish")
+	}
+
+	serverCancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server maxconn run failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("server maxconn did not shut down in time")
+	}
+}
+
+func TestIsBenignClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !isBenignClose(context.Canceled, ctx) {
+		t.Fatal("canceled context should be benign")
+	}
+	if !isBenignClose(io.EOF, context.Background()) {
+		t.Fatal("EOF should be benign")
+	}
+	if !isBenignClose(fmt.Errorf("write closed conn"), context.Background()) {
+		t.Fatal("gohome closed error should be benign")
+	}
+	if isBenignClose(fmt.Errorf("no route to host"), context.Background()) {
+		t.Fatal("unexpected network error should not be benign")
 	}
 }
