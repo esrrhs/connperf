@@ -8,9 +8,11 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -413,13 +415,19 @@ func abs64(v int64) int64 {
 	return v
 }
 
+// rttSampleCap bounds memory/CPU for percentile computation under high
+// sample rates. Exact min/avg/max still use every accepted sample; p50/p90/p99
+// are estimated from a uniform reservoir of at most this many nanosecond values.
+const rttSampleCap = 8192
+
 // rttStats accumulates RTT samples for a reporting period.
 type rttStats struct {
-	mu    sync.Mutex
-	count int64
-	sum   int64 // nanoseconds
-	min   int64
-	max   int64
+	mu      sync.Mutex
+	count   int64
+	sum     int64 // nanoseconds
+	min     int64
+	max     int64
+	samples []int64 // reservoir for percentiles (nanoseconds)
 }
 
 func (s *rttStats) add(ns int64) {
@@ -436,26 +444,68 @@ func (s *rttStats) add(ns int64) {
 	}
 	s.sum += ns
 	s.count++
+	if len(s.samples) < rttSampleCap {
+		s.samples = append(s.samples, ns)
+		return
+	}
+	// Algorithm R: keep a uniform reservoir of size rttSampleCap.
+	j := rand.Int64N(s.count)
+	if j < int64(rttSampleCap) {
+		s.samples[j] = ns
+	}
 }
 
-func (s *rttStats) snapshotAndReset() (count int64, min, avg, max time.Duration, ok bool) {
+// percentileDuration returns the p-th percentile (0..100) of sorted nanosecond
+// samples using linear interpolation between nearest ranks.
+func percentileDuration(sorted []int64, p float64) time.Duration {
+	n := len(sorted)
+	if n == 0 {
+		return 0
+	}
+	if n == 1 || p <= 0 {
+		return time.Duration(sorted[0])
+	}
+	if p >= 100 {
+		return time.Duration(sorted[n-1])
+	}
+	rank := p / 100 * float64(n-1)
+	lo := int(rank)
+	hi := lo + 1
+	if hi >= n {
+		return time.Duration(sorted[n-1])
+	}
+	frac := rank - float64(lo)
+	v := float64(sorted[lo])*(1-frac) + float64(sorted[hi])*frac
+	return time.Duration(v)
+}
+
+func (s *rttStats) snapshotAndReset() (count int64, min, avg, max, p50, p90, p99 time.Duration, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.count == 0 {
-		return 0, 0, 0, 0, false
+		return 0, 0, 0, 0, 0, 0, 0, false
 	}
 	count = s.count
 	min = time.Duration(s.min)
 	max = time.Duration(s.max)
 	avg = time.Duration(s.sum / s.count)
+	if n := len(s.samples); n > 0 {
+		sorted := append([]int64(nil), s.samples...)
+		sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+		p50 = percentileDuration(sorted, 50)
+		p90 = percentileDuration(sorted, 90)
+		p99 = percentileDuration(sorted, 99)
+	}
 	s.count, s.sum, s.min, s.max = 0, 0, 0, 0
-	return count, min, avg, max, true
+	s.samples = s.samples[:0]
+	return count, min, avg, max, p50, p90, p99, true
 }
 
 func (s *rttStats) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.count, s.sum, s.min, s.max = 0, 0, 0, 0
+	s.samples = s.samples[:0]
 }
 
 // jitterState tracks RFC3550-ish inter-arrival jitter from chunk arrivals.
@@ -681,9 +731,10 @@ func printPeriod(cfg Config, useHeader bool, stats *sharedIO, wBytes, rBytes int
 		wVal, wLbl := formatThroughput(wBytes, sec, cfg.Unit)
 		line := fmt.Sprintf("write %.2f %s", wVal, wLbl)
 		if useHeader {
-			if _, rmin, ravg, rmax, ok := stats.periodRTT.snapshotAndReset(); ok {
-				line += fmt.Sprintf(" rtt min/avg/max %s/%s/%s",
-					formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
+			if _, rmin, ravg, rmax, p50, p90, p99, ok := stats.periodRTT.snapshotAndReset(); ok {
+				line += fmt.Sprintf(" rtt min/avg/max/p50/p90/p99 %s/%s/%s/%s/%s/%s",
+					formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax),
+					formatMetricDuration(p50), formatMetricDuration(p90), formatMetricDuration(p99))
 			}
 		}
 		fmt.Printf("%s %v\n", line, info)
@@ -706,9 +757,10 @@ func printSummary(cfg Config, useHeader bool, stats *sharedIO, totalElapsed floa
 		totalMB := float64(tw) / (1024 * 1024)
 		line := fmt.Sprintf("summary: total write %.2f MB, avg speed %.2f %s", totalMB, avgW, wLbl)
 		if useHeader {
-			if _, rmin, ravg, rmax, ok := stats.totalRTT.snapshotAndReset(); ok {
-				line += fmt.Sprintf(", rtt min/avg/max %s/%s/%s",
-					formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
+			if _, rmin, ravg, rmax, p50, p90, p99, ok := stats.totalRTT.snapshotAndReset(); ok {
+				line += fmt.Sprintf(", rtt min/avg/max/p50/p90/p99 %s/%s/%s/%s/%s/%s",
+					formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax),
+					formatMetricDuration(p50), formatMetricDuration(p90), formatMetricDuration(p99))
 			}
 		}
 		fmt.Printf("%s [%v]\n", line, info)

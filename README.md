@@ -23,7 +23,7 @@
 - **Warmup**: `-warmup` seconds of traffic are discarded from stats so averages exclude ramp-up.
 - **Server Accept Limit**: `-maxconn` caps concurrent accepted connections on the server (`0` = unlimited).
 - **Throughput Units**: Choose `-unit MBps` (default, MiB/s), `Mbps`, or `Gbps` for periodic lines and the exit summary.
-- **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
+- **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max and percentiles p50/p90/p99. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
 - **Graceful Shutdown**: Handles OS termination signals (`SIGINT`/`SIGTERM`) cleanly without losing exit statistics.
 - **Cross-Platform & Container-Ready**: Prebuilt binaries for Linux, macOS, Windows, and official Docker images.
@@ -124,7 +124,7 @@ summary: total write 3233.00 MB, avg speed 1616.50 MB/s [127.0.0.1:32758<--tcp--
 
 Sample periodic lines include RTT (sender) and receive jitter when both ends enable `-read` and `-write`:
 ```text
-write 900.00 MB/s rtt min/avg/max 100µs/150µs/400µs 127.0.0.1:32758<--tcp-->127.0.0.1:8888
+write 900.00 MB/s rtt min/avg/max/p50/p90/p99 100µs/150µs/400µs/140µs/200µs/350µs 127.0.0.1:32758<--tcp-->127.0.0.1:8888
 read 880.00 MB/s jitter 12µs (verified 12345 chunks) 127.0.0.1:32758<--tcp-->127.0.0.1:8888
 ```
 

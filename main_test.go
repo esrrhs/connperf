@@ -115,6 +115,118 @@ func TestHeaderEndianness(t *testing.T) {
 	}
 }
 
+func TestPercentileDuration(t *testing.T) {
+	if got := percentileDuration(nil, 50); got != 0 {
+		t.Fatalf("empty: got %v", got)
+	}
+	if got := percentileDuration([]int64{42}, 50); got != 42 {
+		t.Fatalf("single: got %v", got)
+	}
+	// 0,10,...,100 → n=11; p50 at rank 5 → 50; p90 at rank 9 → 90; p99 near 100
+	sorted := make([]int64, 0, 11)
+	for i := 0; i <= 10; i++ {
+		sorted = append(sorted, int64(i*10))
+	}
+	if got := percentileDuration(sorted, 50); got != 50 {
+		t.Fatalf("p50: got %v want 50", got)
+	}
+	if got := percentileDuration(sorted, 90); got != 90 {
+		t.Fatalf("p90: got %v want 90", got)
+	}
+	if got := percentileDuration(sorted, 0); got != 0 {
+		t.Fatalf("p0: got %v want 0", got)
+	}
+	if got := percentileDuration(sorted, 100); got != 100 {
+		t.Fatalf("p100: got %v want 100", got)
+	}
+}
+
+func TestRTTStatsMinAvgMaxPercentiles(t *testing.T) {
+	var s rttStats
+	for i := 1; i <= 100; i++ {
+		s.add(int64(i) * int64(time.Millisecond))
+	}
+	count, min, avg, max, p50, p90, p99, ok := s.snapshotAndReset()
+	if !ok || count != 100 {
+		t.Fatalf("ok=%v count=%d", ok, count)
+	}
+	if min != time.Millisecond {
+		t.Fatalf("min=%v want 1ms", min)
+	}
+	if max != 100*time.Millisecond {
+		t.Fatalf("max=%v want 100ms", max)
+	}
+	// sum 1..100 = 5050 → avg 50.5ms
+	if avg < 50*time.Millisecond || avg > 51*time.Millisecond {
+		t.Fatalf("avg=%v want ~50.5ms", avg)
+	}
+	// linear interp on 1..100ms: p50≈50.5ms, p90≈90.1ms, p99≈99.01ms
+	if p50 < 50*time.Millisecond || p50 > 51*time.Millisecond {
+		t.Fatalf("p50=%v want ~50.5ms", p50)
+	}
+	if p90 < 90*time.Millisecond || p90 > 91*time.Millisecond {
+		t.Fatalf("p90=%v want ~90.1ms", p90)
+	}
+	if p99 < 98*time.Millisecond || p99 > 100*time.Millisecond {
+		t.Fatalf("p99=%v want ~99ms", p99)
+	}
+	// snapshot clears
+	if _, _, _, _, _, _, _, ok2 := s.snapshotAndReset(); ok2 {
+		t.Fatal("expected empty after snapshot")
+	}
+}
+
+func TestRTTStatsRejectNegative(t *testing.T) {
+	var s rttStats
+	s.add(-1)
+	if _, _, _, _, _, _, _, ok := s.snapshotAndReset(); ok {
+		t.Fatal("negative sample should be ignored")
+	}
+}
+
+func TestRTTStatsReservoirCap(t *testing.T) {
+	var s rttStats
+	n := rttSampleCap*3 + 7
+	for i := 0; i < n; i++ {
+		s.add(int64(i + 1))
+	}
+	s.mu.Lock()
+	got := len(s.samples)
+	count := s.count
+	s.mu.Unlock()
+	if got > rttSampleCap {
+		t.Fatalf("reservoir len=%d > cap %d", got, rttSampleCap)
+	}
+	if got != rttSampleCap {
+		t.Fatalf("reservoir len=%d want %d", got, rttSampleCap)
+	}
+	if count != int64(n) {
+		t.Fatalf("count=%d want %d", count, n)
+	}
+	_, min, _, max, p50, p90, p99, ok := s.snapshotAndReset()
+	if !ok {
+		t.Fatal("expected samples")
+	}
+	if min != 1 {
+		t.Fatalf("min=%v want 1", min)
+	}
+	if max != time.Duration(n) {
+		t.Fatalf("max=%v want %d", max, n)
+	}
+	if !(min <= p50 && p50 <= p90 && p90 <= p99 && p99 <= max) {
+		t.Fatalf("percentile order min=%v p50=%v p90=%v p99=%v max=%v", min, p50, p90, p99, max)
+	}
+}
+
+func TestRTTStatsResetClearsSamples(t *testing.T) {
+	var s rttStats
+	s.add(int64(time.Millisecond))
+	s.reset()
+	if _, _, _, _, _, _, _, ok := s.snapshotAndReset(); ok {
+		t.Fatal("reset should clear samples")
+	}
+}
+
 func TestJitterStateRFC3550ish(t *testing.T) {
 	var j jitterState
 	base := time.Now()
