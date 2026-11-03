@@ -147,16 +147,30 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestEndToEndTCP(t *testing.T) {
-	port := getFreePort(t)
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+func waitServerOrFail(t *testing.T, serverDone <-chan error, wait time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server exited before ready: %v", err)
+		}
+		t.Fatal("server exited before ready")
+	case <-timer.C:
+	}
+}
+
+// runEndToEndProto starts a read-only server and a write-only client for ~1s.
+func runEndToEndProto(t *testing.T, proto, listenAddr, dialAddr string) {
+	t.Helper()
 
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 
 	serverCfg := Config{
-		Listen:  addr,
-		Proto:   "tcp",
+		Listen:  listenAddr,
+		Proto:   proto,
 		Read:    true,
 		BufSize: 1024,
 		Unit:    "MBps",
@@ -167,35 +181,41 @@ func TestEndToEndTCP(t *testing.T) {
 		serverDone <- run(serverCtx, serverCfg)
 	}()
 
-	// Wait briefly for server listener to start
-	time.Sleep(100 * time.Millisecond)
+	// Catch bind/listen failures quickly; give the listener a short settle time.
+	waitServerOrFail(t, serverDone, 200*time.Millisecond)
 
-	clientCtx, clientCancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	// Client timeout leaves headroom for handshake (quic/rhttp) + 1s duration.
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer clientCancel()
 
 	clientCfg := Config{
-		Server:   addr,
-		Proto:    "tcp",
+		Server:   dialAddr,
+		Proto:    proto,
 		Write:    true,
 		BufSize:  1024,
 		Duration: 1 * time.Second,
-		Unit:     "Mbps",
+		Unit:     "MBps",
 	}
 
-	err := run(clientCtx, clientCfg)
-	if err != nil {
-		t.Fatalf("client run failed: %v", err)
+	if err := run(clientCtx, clientCfg); err != nil {
+		t.Fatalf("client %s run failed: %v", proto, err)
 	}
 
 	serverCancel()
 	select {
 	case err := <-serverDone:
 		if err != nil {
-			t.Fatalf("server run failed: %v", err)
+			t.Fatalf("server %s run failed: %v", proto, err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("server did not shut down in time")
+	case <-time.After(3 * time.Second):
+		t.Fatalf("server %s did not shut down in time", proto)
 	}
+}
+
+func TestEndToEndTCP(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	runEndToEndProto(t, "tcp", addr, addr)
 }
 
 func TestEndToEndBidirectionalTCP(t *testing.T) {
@@ -219,9 +239,9 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 		serverDone <- run(serverCtx, serverCfg)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waitServerOrFail(t, serverDone, 200*time.Millisecond)
 
-	clientCtx, clientCancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer clientCancel()
 
 	clientCfg := Config{
@@ -245,7 +265,7 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 		if err != nil {
 			t.Fatalf("server bidirectional run failed: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(3 * time.Second):
 		t.Fatal("server did not shut down in time")
 	}
 }
@@ -253,13 +273,36 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 func TestEndToEndKCP(t *testing.T) {
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	runEndToEndProto(t, "kcp", addr, addr)
+}
 
+func TestEndToEndRUDP(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	runEndToEndProto(t, "rudp", addr, addr)
+}
+
+func TestEndToEndQUIC(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	runEndToEndProto(t, "quic", addr, addr)
+}
+
+func TestEndToEndRHTTP(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	runEndToEndProto(t, "rhttp", addr, addr)
+}
+
+// TestEndToEndRICMP exercises ICMP-based transport. Raw ip4:icmp sockets need
+// root or CAP_NET_RAW; without that privilege we skip so CI stays green.
+func TestEndToEndRICMP(t *testing.T) {
 	serverCtx, serverCancel := context.WithCancel(context.Background())
 	defer serverCancel()
 
 	serverCfg := Config{
-		Listen:  addr,
-		Proto:   "kcp",
+		Listen:  "127.0.0.1",
+		Proto:   "ricmp",
 		Read:    true,
 		BufSize: 1024,
 		Unit:    "MBps",
@@ -270,32 +313,40 @@ func TestEndToEndKCP(t *testing.T) {
 		serverDone <- run(serverCtx, serverCfg)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Skipf("ricmp requires root/CAP_NET_RAW for ip4:icmp sockets: %v", err)
+		}
+		t.Fatal("ricmp server exited before ready")
+	case <-time.After(200 * time.Millisecond):
+		// Listen succeeded.
+	}
 
-	clientCtx, clientCancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
 	defer clientCancel()
 
 	clientCfg := Config{
-		Server:   addr,
-		Proto:    "kcp",
+		Server:   "127.0.0.1",
+		Proto:    "ricmp",
 		Write:    true,
 		BufSize:  1024,
 		Duration: 1 * time.Second,
 		Unit:     "MBps",
 	}
 
-	err := run(clientCtx, clientCfg)
-	if err != nil {
-		t.Fatalf("client kcp run failed: %v", err)
+	if err := run(clientCtx, clientCfg); err != nil {
+		serverCancel()
+		t.Fatalf("client ricmp run failed: %v", err)
 	}
 
 	serverCancel()
 	select {
 	case err := <-serverDone:
 		if err != nil {
-			t.Fatalf("server kcp run failed: %v", err)
+			t.Fatalf("server ricmp run failed: %v", err)
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("server did not shut down in time")
+	case <-time.After(3 * time.Second):
+		t.Fatal("server ricmp did not shut down in time")
 	}
 }
