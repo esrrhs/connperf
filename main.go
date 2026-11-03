@@ -29,24 +29,27 @@ const (
 )
 
 type Config struct {
-	Server   string
-	Listen   string
-	Proto    string
-	Write    bool
-	Read     bool
-	BufSize  int
-	Duration time.Duration
-	Unit     string // MBps (default), Mbps, Gbps
-	Conns    int    // client parallel connections (-n), default 1
-	Warmup   time.Duration
-	MaxConn  int // server accept limit (0 = unlimited)
+	Server    string
+	Listen    string
+	Proto     string
+	Write     bool
+	Read      bool
+	BufSize   int
+	Duration  time.Duration
+	Unit      string // MBps (default), Mbps, Gbps
+	Conns     int    // client parallel connections (-n), default 1
+	Warmup    time.Duration
+	MaxConn   int           // server accept limit (0 = unlimited)
+	ProbeTime time.Duration // auto-mode per-protocol probe window (-probe-t)
+	ProbeOnly bool          // auto-mode: print comparison table and exit
+	AutoRICMP bool          // auto-mode: include ricmp (excluded by default)
 }
 
 func main() {
 	fs := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 	server := fs.String("s", "", "server addr")
 	listen := fs.String("l", "", "listen addr")
-	proto := fs.String("p", "tcp", fmt.Sprintf("proto %v", network.SupportReliableProtos()))
+	proto := fs.String("p", "tcp", fmt.Sprintf("proto %v or auto", network.SupportReliableProtos()))
 	write := fs.Bool("write", false, "write")
 	read := fs.Bool("read", false, "read")
 	showVer := fs.Bool("v", false, "show version")
@@ -57,6 +60,9 @@ func main() {
 	conns := fs.Int("n", 1, "client parallel connections (default 1)")
 	warmupSec := fs.Int("warmup", 0, "seconds of traffic ignored in stats (discard counters)")
 	maxConn := fs.Int("maxconn", 0, "server max accepted connections (0 = unlimited)")
+	probeSec := fs.Int("probe-t", 2, "auto mode: per-protocol probe duration in seconds (default 2)")
+	probeOnly := fs.Bool("probe-only", false, "auto mode: print probe comparison table and exit without full run")
+	autoRICMP := fs.Bool("auto-ricmp", false, "auto mode: include ricmp (needs root/CAP_NET_RAW; excluded by default)")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fs.Usage()
@@ -82,8 +88,8 @@ func main() {
 		return
 	}
 
-	if !network.HasReliableProto(*proto) {
-		fmt.Printf("unsupported protocol: %s, supported: %v\n", *proto, network.SupportReliableProtos())
+	if !isAutoProto(*proto) && !network.HasReliableProto(*proto) {
+		fmt.Printf("unsupported protocol: %s, supported: %v or auto\n", *proto, network.SupportReliableProtos())
 		fs.Usage()
 		return
 	}
@@ -111,19 +117,32 @@ func main() {
 		fs.Usage()
 		os.Exit(1)
 	}
+	if *probeSec < 1 {
+		fmt.Fprintf(os.Stderr, "error: -probe-t must be >= 1\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if (*probeOnly || *autoRICMP) && !isAutoProto(*proto) {
+		fmt.Fprintf(os.Stderr, "error: -probe-only / -auto-ricmp require -p auto\n")
+		fs.Usage()
+		os.Exit(1)
+	}
 
 	cfg := Config{
-		Server:   *server,
-		Listen:   *listen,
-		Proto:    *proto,
-		Write:    *write,
-		Read:     *read,
-		BufSize:  *bufSize,
-		Duration: time.Duration(*durationSec) * time.Second,
-		Unit:     normUnit,
-		Conns:    n,
-		Warmup:   time.Duration(*warmupSec) * time.Second,
-		MaxConn:  *maxConn,
+		Server:    *server,
+		Listen:    *listen,
+		Proto:     *proto,
+		Write:     *write,
+		Read:      *read,
+		BufSize:   *bufSize,
+		Duration:  time.Duration(*durationSec) * time.Second,
+		Unit:      normUnit,
+		Conns:     n,
+		Warmup:    time.Duration(*warmupSec) * time.Second,
+		MaxConn:   *maxConn,
+		ProbeTime: time.Duration(*probeSec) * time.Second,
+		ProbeOnly: *probeOnly,
+		AutoRICMP: *autoRICMP,
 	}
 
 	if cfg.BufSize <= 0 {
@@ -133,7 +152,10 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if cfg.Duration > 0 {
+	// Auto client probes each protocol for -probe-t (plus warmup) before the
+	// full run; apply -t only to non-auto runs here. Auto full-run duration is
+	// enforced inside runAutoClient.
+	if cfg.Duration > 0 && !isAutoProto(cfg.Proto) {
 		var dCancel context.CancelFunc
 		ctx, dCancel = context.WithTimeout(ctx, cfg.Duration)
 		defer dCancel()
@@ -185,6 +207,16 @@ func formatThroughput(bytes int64, sec float64, unit string) (value float64, lab
 }
 
 func run(ctx context.Context, cfg Config) error {
+	if isAutoProto(cfg.Proto) {
+		if cfg.Server != "" {
+			return runAutoClient(ctx, cfg)
+		}
+		if cfg.Listen != "" {
+			return runAutoServer(ctx, cfg)
+		}
+		return nil
+	}
+
 	c, err := network.NewConn(cfg.Proto)
 	if err != nil {
 		return fmt.Errorf("create conn %s failed: %w", cfg.Proto, err)

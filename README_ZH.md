@@ -25,6 +25,7 @@
 - **吞吐单位**：通过 `-unit MBps`（默认，二进制 MiB/s）、`Mbps` 或 `Gbps` 选择周期输出与汇总的单位。
 - **RTT 与抖动**：双向（`-read -write`）模式下在 payload 前嵌入 16 字节小端头（`seq` + `send_ns`），对端在写路径上回显该头，发送端据此统计 RTT min/avg/max 以及百分位 p50/p90/p99；接收端同时输出近似 RFC3550 的到达间隔抖动。单向测试仅报告吞吐与接收抖动（RTT 需要双向，不会因此失败）。
 - **实时吞吐监控与汇总**：每秒输出实时速率，退出时打印总传输数据量与全程平均带宽。
+- **自动协议选择**：`-p auto` 按文档化端口映射探测各可靠协议，打印对比表，并在胜出协议上跑完整测试（`-probe-t`、`-probe-only`，可选 `-auto-ricmp`）。
 - **优雅退出处理**：捕获系统信号（`SIGINT`/`SIGTERM`），退出时不丢失统计数据并释放资源。
 - **跨平台与容器化支持**：提供 Linux、macOS、Windows 预编译二进制文件及 Docker 容器镜像。
 
@@ -63,7 +64,7 @@ Usage of connperf:
   -s string
         目标服务器地址（客户端模式，如 1.2.3.4:8888）
   -p string
-        传输协议类型：tcp, rudp, ricmp, kcp, quic, rhttp（默认 "tcp"）
+        传输协议类型：tcp, rudp, ricmp, kcp, quic, rhttp，或 auto（默认 "tcp"）
   -write
         开启发送/写入模式
   -read
@@ -71,15 +72,21 @@ Usage of connperf:
   -buf int
         固定 payload 大小，单位字节（默认 1024）；每轮按该长度发送并校验
   -t int
-        测试持续时间，单位秒（默认 0，表示持续运行直至手动中断）
+        测试持续时间，单位秒（默认 0，表示持续运行直至手动中断）；`-p auto` 时仅作用于探测之后的完整测试
   -unit string
         吞吐单位：MBps（默认，二进制 MiB/s）、Mbps 或 Gbps
   -n int
-        客户端并行连接数（默认 1）
+        客户端并行连接数（默认 1）；用于 auto 的完整测试（探测阶段固定 1 条连接）
   -warmup int
-        统计忽略的预热秒数 / 丢弃计数器（默认 0）
+        统计忽略的预热秒数 / 丢弃计数器（默认 0）；auto 探测阶段同样生效
   -maxconn int
         服务端最大接受连接数（0 表示不限制）
+  -probe-t int
+        auto 模式：每个协议的探测时长（秒，默认 2）
+  -probe-only
+        auto 模式：只打印探测对比表后退出，不跑完整测试
+  -auto-ricmp
+        auto 模式：纳入 ricmp（需要 root/CAP_NET_RAW；默认排除）
   -v
         显示简短版本号
   -version
@@ -148,6 +155,36 @@ read 880.00 MB/s jitter 12µs (verified 12345 chunks) 127.0.0.1:32758<--tcp-->12
 ```
 
 周期输出与汇总为跨 `-n` 连接的**聚合**吞吐（会带类似 `4 conns, e.g. …` 的简短说明）。
+
+### 2d. 自动协议选择（`-p auto`）
+
+服务端按 `-l` 中的**基准端口**同时监听多种可靠协议（固定端口映射）。客户端对每个候选协议探测 `-probe-t` 秒（默认 2），在可选 `-warmup` 之后统计**写**吞吐平均值，打印对比表，再在胜出协议对应的映射端口上执行完整测试（`-t`/`-n`/`-unit`/…）。
+
+**端口映射**（基准端口为 `-l` / `-s` 中的 `P`）：
+
+| 协议 | 地址 |
+| :--- | :--- |
+| **tcp** | `P + 0` |
+| **rudp** | `P + 1` |
+| **kcp** | `P + 2` |
+| **quic** | `P + 3` |
+| **rhttp** | `P + 4` |
+| **ricmp**（可选） | 仅主机（ICMP；无 TCP/UDP 端口） |
+
+`ricmp` **默认排除**（原始套接字）。两端都加 `-auto-ricmp` 才会纳入。
+
+```bash
+# 服务端：基准 :8888 → tcp:8888, rudp:8889, kcp:8890, quic:8891, rhttp:8892
+./connperf -l :8888 -p auto -read
+
+# 客户端：探测各协议并打印表格，再对胜出者跑 30 秒完整测试
+./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -t 30
+
+# 仅探测（不跑完整测试）
+./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-only
+```
+
+请放行防火墙端口 `P` 到 `P+4`（若使用 `-auto-ricmp` 还需放行 ICMP），并确保派生端口未被占用。
 
 ### 3. 其他协议（KCP、RUDP、QUIC 等）
 

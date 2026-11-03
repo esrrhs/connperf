@@ -25,6 +25,7 @@
 - **Throughput Units**: Choose `-unit MBps` (default, MiB/s), `Mbps`, or `Gbps` for periodic lines and the exit summary.
 - **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max and percentiles p50/p90/p99. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
+- **Auto Protocol Selection**: `-p auto` probes reliable protocols across a documented port map, prints a comparison table, and runs the full test on the winner (`-probe-t`, `-probe-only`, optional `-auto-ricmp`).
 - **Graceful Shutdown**: Handles OS termination signals (`SIGINT`/`SIGTERM`) cleanly without losing exit statistics.
 - **Cross-Platform & Container-Ready**: Prebuilt binaries for Linux, macOS, Windows, and official Docker images.
 
@@ -63,7 +64,7 @@ Usage of connperf:
   -s string
         target server address (client mode, e.g. 1.2.3.4:8888)
   -p string
-        transport protocol: tcp, rudp, ricmp, kcp, quic, rhttp (default "tcp")
+        transport protocol: tcp, rudp, ricmp, kcp, quic, rhttp, or auto (default "tcp")
   -write
         enable write / sending mode
   -read
@@ -71,15 +72,21 @@ Usage of connperf:
   -buf int
         fixed payload size in bytes (default 1024); each round is sent/verified as one chunk
   -t int
-        test duration in seconds (0 for indefinite until interrupted)
+        test duration in seconds (0 for indefinite until interrupted); in -p auto this applies to the full run after probing
   -unit string
         throughput unit: MBps (default, binary MiB/s), Mbps, or Gbps
   -n int
-        client parallel connections (default 1)
+        client parallel connections (default 1); used for the full auto run (probes use 1 conn)
   -warmup int
-        seconds of traffic ignored in stats / discarded from counters (default 0)
+        seconds of traffic ignored in stats / discarded from counters (default 0); also applied during auto probes
   -maxconn int
         server max accepted connections (0 = unlimited)
+  -probe-t int
+        auto mode: per-protocol probe duration in seconds (default 2)
+  -probe-only
+        auto mode: print the probe comparison table and exit without a full run
+  -auto-ricmp
+        auto mode: include ricmp (needs root/CAP_NET_RAW; excluded by default)
   -v
         show concise version
   -version
@@ -148,6 +155,36 @@ One-way (`-write` only / `-read` only) still reports throughput; the reader also
 ```
 
 Periodic and summary lines report **aggregate** throughput across the `-n` connections (a short note such as `4 conns, e.g. …` identifies the set).
+
+### 2d. Auto protocol selection (`-p auto`)
+
+Server listens on **multiple** reliable protocols using a fixed port map derived from the base port in `-l`. Client probes each candidate for `-probe-t` seconds (default 2), measuring **write** throughput after optional `-warmup`, prints a comparison table, then runs the full test (`-t`/`-n`/`-unit`/…) on the winner at the matching mapped port.
+
+**Port map** (base port `P` from `-l` / `-s`):
+
+| Protocol | Address |
+| :--- | :--- |
+| **tcp** | `P + 0` |
+| **rudp** | `P + 1` |
+| **kcp** | `P + 2` |
+| **quic** | `P + 3` |
+| **rhttp** | `P + 4` |
+| **ricmp** (opt-in) | host only (ICMP; no TCP/UDP port) |
+
+`ricmp` is **excluded by default** (raw sockets). Pass `-auto-ricmp` on both ends to include it.
+
+```bash
+# Server: listen on base :8888 → tcp:8888, rudp:8889, kcp:8890, quic:8891, rhttp:8892
+./connperf -l :8888 -p auto -read
+
+# Client: probe each protocol, print table, then full 30s run on the winner
+./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -t 30
+
+# Probe only (no full run)
+./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-only
+```
+
+Open firewall ports `P` through `P+4` (and ICMP if using `-auto-ricmp`). Ensure nothing else binds those derived ports.
 
 ### 3. Alternative Protocols (e.g. KCP, RUDP, QUIC)
 
