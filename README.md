@@ -17,8 +17,10 @@
 
 - **Multi-Protocol Support**: Benchmark across `tcp`, `rudp`, `ricmp`, `kcp`, `quic`, and `rhttp`.
 - **Directional & Full-Duplex Modes**: Supports separate `-write` (upload), `-read` (download), or bidirectional simultaneous testing.
-- **Fixed Payload Verification**: Sends a deterministic payload (default 1024 bytes) in a loop; the receiver validates every chunk.
+- **Fixed Payload Verification**: Sends a deterministic payload (default 1024 bytes) in a loop; the receiver validates every chunk (header region excluded when RTT headers are in use).
 - **Configurable Payload & Duration**: Customize payload size (`-buf`, bytes) and timed execution duration (`-t`).
+- **Throughput Units**: Choose `-unit MBps` (default, MiB/s), `Mbps`, or `Gbps` for periodic lines and the exit summary.
+- **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
 - **Graceful Shutdown**: Handles OS termination signals (`SIGINT`/`SIGTERM`) cleanly without losing exit statistics.
 - **Cross-Platform & Container-Ready**: Prebuilt binaries for Linux, macOS, Windows, and official Docker images.
@@ -67,6 +69,8 @@ Usage of connperf:
         fixed payload size in bytes (default 1024); each round is sent/verified as one chunk
   -t int
         test duration in seconds (0 for indefinite until interrupted)
+  -unit string
+        throughput unit: MBps (default, binary MiB/s), Mbps, or Gbps
   -v
         show concise version
   -version
@@ -97,7 +101,7 @@ write 1168.00 MB/s 127.0.0.1:32758<--tcp-->127.0.0.1:8888
 summary: total write 3233.00 MB, avg speed 1616.50 MB/s [127.0.0.1:32758<--tcp-->127.0.0.1:8888]
 ```
 
-### 2. Bidirectional / Full-Duplex Benchmark
+### 2. Bidirectional / Full-Duplex Benchmark (throughput + RTT + jitter)
 
 * **Server**:
 ```bash
@@ -107,6 +111,21 @@ summary: total write 3233.00 MB, avg speed 1616.50 MB/s [127.0.0.1:32758<--tcp--
 * **Client**:
 ```bash
 ./connperf -s 127.0.0.1:8888 -p tcp -read -write
+```
+
+Sample periodic lines include RTT (sender) and receive jitter when both ends enable `-read` and `-write`:
+```text
+write 900.00 MB/s rtt min/avg/max 100µs/150µs/400µs 127.0.0.1:32758<--tcp-->127.0.0.1:8888
+read 880.00 MB/s jitter 12µs (verified 12345 chunks) 127.0.0.1:32758<--tcp-->127.0.0.1:8888
+```
+
+One-way (`-write` only / `-read` only) still reports throughput; the reader also reports jitter and prints a note that RTT needs bidirectional mode.
+
+### 2b. Throughput unit selection
+
+```bash
+./connperf -s 127.0.0.1:8888 -p tcp -write -unit Mbps
+./connperf -s 127.0.0.1:8888 -p tcp -write -unit Gbps
 ```
 
 ### 3. Alternative Protocols (e.g. KCP, RUDP, QUIC)

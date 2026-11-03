@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"testing"
@@ -47,6 +48,88 @@ func TestMakePayload(t *testing.T) {
 	}
 }
 
+func TestNormalizeUnit(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+		fail bool
+	}{
+		{"", "MBps", false},
+		{"MBps", "MBps", false},
+		{"MB/s", "MBps", false},
+		{"Mbps", "Mbps", false},
+		{"mbps", "Mbps", false},
+		{"Mbit/s", "Mbps", false},
+		{"Gbps", "Gbps", false},
+		{"gbps", "Gbps", false},
+		{"Gbit/s", "Gbps", false},
+		{"bogus", "", true},
+	}
+	for _, tc := range cases {
+		got, err := normalizeUnit(tc.in)
+		if tc.fail {
+			if err == nil {
+				t.Fatalf("normalizeUnit(%q) expected error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatalf("normalizeUnit(%q): %v", tc.in, err)
+		}
+		if got != tc.want {
+			t.Fatalf("normalizeUnit(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestFormatThroughput(t *testing.T) {
+	// 2 MiB in 1 second → 2.00 MB/s
+	v, lbl := formatThroughput(2*1024*1024, 1, "MBps")
+	if lbl != "MB/s" || v < 1.99 || v > 2.01 {
+		t.Fatalf("MBps: got %f %s", v, lbl)
+	}
+	// 1_000_000 bytes in 1s → 8 Mbps
+	v, lbl = formatThroughput(1_000_000, 1, "Mbps")
+	if lbl != "Mbps" || v < 7.99 || v > 8.01 {
+		t.Fatalf("Mbps: got %f %s", v, lbl)
+	}
+	// 125_000_000 bytes in 1s → 1 Gbps
+	v, lbl = formatThroughput(125_000_000, 1, "Gbps")
+	if lbl != "Gbps" || v < 0.99 || v > 1.01 {
+		t.Fatalf("Gbps: got %f %s", v, lbl)
+	}
+}
+
+func TestHeaderEndianness(t *testing.T) {
+	buf := make([]byte, headerSize)
+	seq := uint64(0x0102030405060708)
+	ns := uint64(0x1122334455667788)
+	binary.LittleEndian.PutUint64(buf[0:8], seq)
+	binary.LittleEndian.PutUint64(buf[8:16], ns)
+	if binary.LittleEndian.Uint64(buf[0:8]) != seq {
+		t.Fatal("seq roundtrip failed")
+	}
+	if binary.LittleEndian.Uint64(buf[8:16]) != ns {
+		t.Fatal("ns roundtrip failed")
+	}
+}
+
+func TestJitterStateRFC3550ish(t *testing.T) {
+	var j jitterState
+	base := time.Now()
+	j.onArrival(base)
+	j.onArrival(base.Add(10 * time.Millisecond))
+	j.onArrival(base.Add(20 * time.Millisecond)) // stable 10ms gaps → low jitter after first D
+	j.onArrival(base.Add(40 * time.Millisecond)) // 20ms gap → introduces jitter
+	d, ok := j.value()
+	if !ok {
+		t.Fatal("expected jitter samples")
+	}
+	if d < 0 {
+		t.Fatalf("jitter negative: %v", d)
+	}
+}
+
 func TestConfigValidation(t *testing.T) {
 	cfg := Config{
 		Server:  "",
@@ -55,6 +138,7 @@ func TestConfigValidation(t *testing.T) {
 		Write:   true,
 		Read:    false,
 		BufSize: 1024,
+		Unit:    "MBps",
 	}
 	// Neither server nor listen
 	err := run(context.Background(), cfg)
@@ -75,6 +159,7 @@ func TestEndToEndTCP(t *testing.T) {
 		Proto:   "tcp",
 		Read:    true,
 		BufSize: 1024,
+		Unit:    "MBps",
 	}
 
 	serverDone := make(chan error, 1)
@@ -94,6 +179,7 @@ func TestEndToEndTCP(t *testing.T) {
 		Write:    true,
 		BufSize:  1024,
 		Duration: 1 * time.Second,
+		Unit:     "Mbps",
 	}
 
 	err := run(clientCtx, clientCfg)
@@ -125,6 +211,7 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 		Write:   true,
 		Read:    true,
 		BufSize: 1024,
+		Unit:    "MBps",
 	}
 
 	serverDone := make(chan error, 1)
@@ -144,6 +231,7 @@ func TestEndToEndBidirectionalTCP(t *testing.T) {
 		Read:     true,
 		BufSize:  1024,
 		Duration: 1 * time.Second,
+		Unit:     "MBps",
 	}
 
 	err := run(clientCtx, clientCfg)
@@ -174,6 +262,7 @@ func TestEndToEndKCP(t *testing.T) {
 		Proto:   "kcp",
 		Read:    true,
 		BufSize: 1024,
+		Unit:    "MBps",
 	}
 
 	serverDone := make(chan error, 1)
@@ -192,6 +281,7 @@ func TestEndToEndKCP(t *testing.T) {
 		Write:    true,
 		BufSize:  1024,
 		Duration: 1 * time.Second,
+		Unit:     "MBps",
 	}
 
 	err := run(clientCtx, clientCfg)

@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,7 +19,10 @@ import (
 	"github.com/esrrhs/gohome/network"
 )
 
-const defaultPayloadSize = 1024
+const (
+	defaultPayloadSize = 1024
+	headerSize         = 16 // seq uint64 + send_ns uint64 (little-endian)
+)
 
 type Config struct {
 	Server   string
@@ -27,6 +32,7 @@ type Config struct {
 	Read     bool
 	BufSize  int
 	Duration time.Duration
+	Unit     string // MBps (default), Mbps, Gbps
 }
 
 func main() {
@@ -40,6 +46,7 @@ func main() {
 	showVersion := fs.Bool("version", false, "show full version")
 	bufSize := fs.Int("buf", defaultPayloadSize, "fixed payload size in bytes (sent/verified each round)")
 	durationSec := fs.Int("t", 0, "test duration in seconds (0 for indefinite)")
+	unit := fs.String("unit", "MBps", "throughput unit: MBps (default), Mbps, or Gbps")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fs.Usage()
@@ -71,6 +78,13 @@ func main() {
 		return
 	}
 
+	normUnit, err := normalizeUnit(*unit)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		fs.Usage()
+		os.Exit(1)
+	}
+
 	cfg := Config{
 		Server:   *server,
 		Listen:   *listen,
@@ -79,6 +93,7 @@ func main() {
 		Read:     *read,
 		BufSize:  *bufSize,
 		Duration: time.Duration(*durationSec) * time.Second,
+		Unit:     normUnit,
 	}
 
 	if cfg.BufSize <= 0 {
@@ -97,6 +112,45 @@ func main() {
 	if err := run(ctx, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+func normalizeUnit(u string) (string, error) {
+	u = strings.TrimSpace(u)
+	switch u {
+	case "", "MBps", "MB/s":
+		return "MBps", nil
+	case "Mbps", "Mbit/s":
+		return "Mbps", nil
+	case "Gbps", "Gbit/s":
+		return "Gbps", nil
+	}
+	switch strings.ToLower(u) {
+	case "mbps":
+		// Lowercase mbps → megabits/sec (network convention).
+		return "Mbps", nil
+	case "gbps":
+		return "Gbps", nil
+	case "mb/s", "mib/s", "mibps":
+		return "MBps", nil
+	}
+	return "", fmt.Errorf("unsupported -unit %q (want MBps, Mbps, or Gbps)", u)
+}
+
+// formatThroughput converts byte count over elapsed seconds into the selected unit.
+// MBps uses binary MiB/s (1024^2); Mbps/Gbps use decimal bits (1e6 / 1e9).
+func formatThroughput(bytes int64, sec float64, unit string) (value float64, label string) {
+	if sec <= 0 {
+		sec = 1
+	}
+	bps := float64(bytes) / sec
+	switch unit {
+	case "Mbps":
+		return bps * 8 / 1e6, "Mbps"
+	case "Gbps":
+		return bps * 8 / 1e9, "Gbps"
+	default:
+		return bps / (1024 * 1024), "MB/s"
 	}
 }
 
@@ -225,12 +279,144 @@ func readFull(c network.Conn, buf []byte) (int, error) {
 	return total, nil
 }
 
+
+func formatMetricDuration(d time.Duration) string {
+	d = d.Round(time.Microsecond)
+	if d == 0 {
+		return "0µs"
+	}
+	return d.String()
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// rttStats accumulates RTT samples for a reporting period.
+type rttStats struct {
+	mu    sync.Mutex
+	count int64
+	sum   int64 // nanoseconds
+	min   int64
+	max   int64
+}
+
+func (s *rttStats) add(ns int64) {
+	if ns < 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count == 0 || ns < s.min {
+		s.min = ns
+	}
+	if s.count == 0 || ns > s.max {
+		s.max = ns
+	}
+	s.sum += ns
+	s.count++
+}
+
+func (s *rttStats) snapshotAndReset() (count int64, min, avg, max time.Duration, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.count == 0 {
+		return 0, 0, 0, 0, false
+	}
+	count = s.count
+	min = time.Duration(s.min)
+	max = time.Duration(s.max)
+	avg = time.Duration(s.sum / s.count)
+	s.count, s.sum, s.min, s.max = 0, 0, 0, 0
+	return count, min, avg, max, true
+}
+
+// jitterState tracks RFC3550-ish inter-arrival jitter from chunk arrivals.
+type jitterState struct {
+	mu        sync.Mutex
+	jitter    int64 // smoothed, nanoseconds
+	lastArr   time.Time
+	lastDelta int64
+	hasDelta  bool
+	samples   int64
+}
+
+func (j *jitterState) onArrival(now time.Time) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if !j.lastArr.IsZero() {
+		delta := now.Sub(j.lastArr).Nanoseconds()
+		if j.hasDelta {
+			d := abs64(delta - j.lastDelta)
+			// RFC 3550: J = J + (|D| - J) / 16
+			j.jitter = j.jitter + (d-j.jitter)/16
+			j.samples++
+		}
+		j.lastDelta = delta
+		j.hasDelta = true
+	}
+	j.lastArr = now
+}
+
+func (j *jitterState) value() (time.Duration, bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.samples == 0 {
+		return 0, false
+	}
+	return time.Duration(j.jitter), true
+}
+
+const sentTrackCap = 4096
+
+type sentTrack struct {
+	mu   sync.Mutex
+	times map[uint64]uint64 // seq -> send_ns
+}
+
+func newSentTrack() *sentTrack {
+	return &sentTrack{times: make(map[uint64]uint64, 1024)}
+}
+
+func (t *sentTrack) put(seq, ns uint64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if len(t.times) >= sentTrackCap {
+		// Drop an arbitrary old entry to bound memory.
+		for k := range t.times {
+			delete(t.times, k)
+			break
+		}
+	}
+	t.times[seq] = ns
+}
+
+func (t *sentTrack) take(seq uint64) (uint64, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ns, ok := t.times[seq]
+	if ok {
+		delete(t.times, seq)
+	}
+	return ns, ok
+}
+
 func show(ctx context.Context, c network.Conn, cfg Config) error {
 	payloadSize := cfg.BufSize
 	if payloadSize <= 0 {
 		payloadSize = defaultPayloadSize
 	}
 	payload := makePayload(payloadSize)
+
+	// Header/RTT path: both directions on this connection so peer can echo.
+	useHeader := cfg.Write && cfg.Read && payloadSize >= headerSize
+	bodyOff := 0
+	if useHeader {
+		bodyOff = headerSize
+	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -240,6 +426,16 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 	var periodWriten atomic.Int64
 	var periodReadn atomic.Int64
 	var verifiedChunks atomic.Int64
+	var writeSeq atomic.Uint64
+
+	var periodRTT rttStats
+	var totalRTT rttStats
+	var recvJitter jitterState
+	sent := newSentTrack()
+
+	var echoMu sync.Mutex
+	var echoSeq, echoNs uint64
+	var echoValid bool
 
 	var failOnce sync.Once
 	var failErr error
@@ -254,6 +450,10 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 		})
 	}
 
+	if cfg.Read && !cfg.Write {
+		fmt.Printf("note: RTT requires bidirectional (-read and -write on both ends); reporting throughput and receive jitter only\n")
+	}
+
 	startTime := time.Now()
 	var wg sync.WaitGroup
 
@@ -261,6 +461,9 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			wbuf := make([]byte, payloadSize)
+			copy(wbuf, payload)
+
 			for {
 				select {
 				case <-ctx.Done():
@@ -268,7 +471,30 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 				default:
 				}
 
-				n, err := writeFull(c, payload)
+				if useHeader {
+					echoMu.Lock()
+					doEcho := echoValid
+					es, en := echoSeq, echoNs
+					if doEcho {
+						echoValid = false
+					}
+					echoMu.Unlock()
+
+					if doEcho {
+						binary.LittleEndian.PutUint64(wbuf[0:8], es)
+						binary.LittleEndian.PutUint64(wbuf[8:16], en)
+					} else {
+						seq := writeSeq.Add(1)
+						ns := uint64(time.Now().UnixNano())
+						binary.LittleEndian.PutUint64(wbuf[0:8], seq)
+						binary.LittleEndian.PutUint64(wbuf[8:16], ns)
+						sent.put(seq, ns)
+					}
+					// Body stays the deterministic pattern (header region excluded).
+					copy(wbuf[bodyOff:], payload[bodyOff:])
+				}
+
+				n, err := writeFull(c, wbuf)
 				if n > 0 {
 					totalWriten.Add(int64(n))
 					periodWriten.Add(int64(n))
@@ -293,6 +519,7 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 				}
 
 				n, err := readFull(c, rbuf)
+				arrive := time.Now()
 				if n > 0 {
 					totalReadn.Add(int64(n))
 					periodReadn.Add(int64(n))
@@ -302,9 +529,28 @@ func show(ctx context.Context, c network.Conn, cfg Config) error {
 					return
 				}
 
-				if !bytes.Equal(rbuf, payload) {
-					mismatch := 0
-					for i := 0; i < payloadSize; i++ {
+				recvJitter.onArrival(arrive)
+
+				if useHeader {
+					seq := binary.LittleEndian.Uint64(rbuf[0:8])
+					ns := binary.LittleEndian.Uint64(rbuf[8:16])
+					if _, ok := sent.take(seq); ok {
+						rtt := arrive.UnixNano() - int64(ns)
+						periodRTT.add(rtt)
+						totalRTT.add(rtt)
+					} else {
+						// Peer's own stamp — queue for echo on our next write.
+						echoMu.Lock()
+						echoSeq, echoNs = seq, ns
+						echoValid = true
+						echoMu.Unlock()
+					}
+				}
+
+				// Verify deterministic body; skip header when present.
+				if !bytes.Equal(rbuf[bodyOff:], payload[bodyOff:]) {
+					mismatch := bodyOff
+					for i := bodyOff; i < payloadSize; i++ {
 						if rbuf[i] != payload[i] {
 							mismatch = i
 							break
@@ -338,13 +584,24 @@ loop:
 			sec := float64(elapse) / float64(time.Second)
 			if sec > 0 {
 				if cfg.Write {
-					wMBps := (float64(wBytes) / (1024 * 1024)) / sec
-					fmt.Printf("write %.2f MB/s %v\n", wMBps, c.Info())
+					wVal, wLbl := formatThroughput(wBytes, sec, cfg.Unit)
+					line := fmt.Sprintf("write %.2f %s", wVal, wLbl)
+					if useHeader {
+						if _, rmin, ravg, rmax, ok := periodRTT.snapshotAndReset(); ok {
+							line += fmt.Sprintf(" rtt min/avg/max %s/%s/%s",
+								formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
+						}
+					}
+					fmt.Printf("%s %v\n", line, c.Info())
 				}
 				if cfg.Read {
-					rMBps := (float64(rBytes) / (1024 * 1024)) / sec
-					fmt.Printf("read %.2f MB/s (verified %d chunks) %v\n",
-						rMBps, verifiedChunks.Load(), c.Info())
+					rVal, rLbl := formatThroughput(rBytes, sec, cfg.Unit)
+					line := fmt.Sprintf("read %.2f %s", rVal, rLbl)
+					if j, ok := recvJitter.value(); ok {
+						line += fmt.Sprintf(" jitter %s", formatMetricDuration(j))
+					}
+					line += fmt.Sprintf(" (verified %d chunks)", verifiedChunks.Load())
+					fmt.Printf("%s %v\n", line, c.Info())
 				}
 			}
 		}
@@ -356,15 +613,27 @@ loop:
 	if totalElapsed > 0 {
 		if cfg.Write {
 			tw := totalWriten.Load()
-			avgW := (float64(tw) / (1024 * 1024)) / totalElapsed
-			fmt.Printf("summary: total write %.2f MB, avg speed %.2f MB/s [%v]\n",
-				float64(tw)/(1024*1024), avgW, c.Info())
+			avgW, wLbl := formatThroughput(tw, totalElapsed, cfg.Unit)
+			totalMB := float64(tw) / (1024 * 1024)
+			line := fmt.Sprintf("summary: total write %.2f MB, avg speed %.2f %s", totalMB, avgW, wLbl)
+			if useHeader {
+				if _, rmin, ravg, rmax, ok := totalRTT.snapshotAndReset(); ok {
+					line += fmt.Sprintf(", rtt min/avg/max %s/%s/%s",
+						formatMetricDuration(rmin), formatMetricDuration(ravg), formatMetricDuration(rmax))
+				}
+			}
+			fmt.Printf("%s [%v]\n", line, c.Info())
 		}
 		if cfg.Read {
 			tr := totalReadn.Load()
-			avgR := (float64(tr) / (1024 * 1024)) / totalElapsed
-			fmt.Printf("summary: total read %.2f MB, avg speed %.2f MB/s, verified %d chunks [%v]\n",
-				float64(tr)/(1024*1024), avgR, verifiedChunks.Load(), c.Info())
+			avgR, rLbl := formatThroughput(tr, totalElapsed, cfg.Unit)
+			totalMB := float64(tr) / (1024 * 1024)
+			line := fmt.Sprintf("summary: total read %.2f MB, avg speed %.2f %s, verified %d chunks",
+				totalMB, avgR, rLbl, verifiedChunks.Load())
+			if j, ok := recvJitter.value(); ok {
+				line += fmt.Sprintf(", jitter %s", formatMetricDuration(j))
+			}
+			fmt.Printf("%s [%v]\n", line, c.Info())
 		}
 	}
 
