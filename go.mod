@@ -2,7 +2,7 @@ module github.com/esrrhs/connperf
 
 go 1.27.3
 
-require github.com/esrrhs/gohome v0.0.0-20261105234305-b79bb858ddeb
+require github.com/esrrhs/gohome v0.0.0-20261105234625-1a0681805eeb
 
 require (
 	github.com/OneOfOne/xxhash v1.2.8 // indirect
