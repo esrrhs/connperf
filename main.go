@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/esrrhs/connperf/version"
+	"github.com/esrrhs/gohome/loggo"
 	"github.com/esrrhs/gohome/network"
 )
 
@@ -48,6 +49,8 @@ type Config struct {
 	RdnsPSK       string        // RDNS underlay AES-GCM PSK payload encryption
 	RdnsQueryType string        // RDNS query type: TXT (default) or NULL
 	RdnsUpstream  string        // RDNS upstream DNS server
+	Key           string        // obfuscation/encryption key
+	Debug         bool
 }
 
 func main() {
@@ -73,6 +76,8 @@ func main() {
 	rdnsPSK := fs.String("rdnspsk", "", "RDNS underlay AES-GCM PSK payload encryption")
 	rdnsQueryType := fs.String("rdnsquerytype", "TXT", "RDNS query type: TXT (default) or NULL")
 	rdnsUpstream := fs.String("rdnsupstream", "", "RDNS upstream DNS server for non-tunnel queries")
+	key := fs.String("key", "", "obfuscation/encryption key")
+	debug := fs.Bool("debug", false, "enable debug logging and internal stat printing")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fs.Usage()
@@ -168,6 +173,18 @@ func main() {
 		RdnsPSK:       *rdnsPSK,
 		RdnsQueryType: *rdnsQueryType,
 		RdnsUpstream:  *rdnsUpstream,
+		Key:           *key,
+		Debug:         *debug,
+	}
+
+	if *debug {
+		loggo.Ini(loggo.Config{
+			Level:      loggo.LEVEL_DEBUG,
+			Prefix:     "connperf",
+			NoLogFile:  true,
+			NoPrint:    false,
+			NoLogColor: false,
+		})
 	}
 
 	if cfg.BufSize <= 0 {
@@ -253,6 +270,16 @@ func newConn(proto string, cfg Config) (network.Conn, error) {
 			}
 			rc.SetConfig(rcCfg)
 		}
+	}
+	if rc, ok := c.(*network.RudpConn); ok {
+		rcCfg := rc.GetConfig()
+		if cfg.Key != "" {
+			rcCfg.Key = cfg.Key
+		}
+		if cfg.Debug {
+			rcCfg.Stat = 1
+		}
+		rc.SetConfig(rcCfg)
 	}
 	return c, nil
 }
