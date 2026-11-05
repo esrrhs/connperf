@@ -14,6 +14,8 @@ github.com/esrrhs/gohome v0.0.0-20261105234305-b79bb858ddeb h1:cgszJID0FK4glg7xR
 github.com/esrrhs/gohome v0.0.0-20261105234305-b79bb858ddeb/go.mod h1:lW8YYqIHg13UePFzIQwqCvCWm6pl6fcsqChZxi1uQMs=
 github.com/esrrhs/gohome v0.0.0-20261105234625-1a0681805eeb h1:uRddtOF6GlGuk/qaGA0PRntL4e76IhYGfoRbP7jGUF0=
 github.com/esrrhs/gohome v0.0.0-20261105234625-1a0681805eeb/go.mod h1:lW8YYqIHg13UePFzIQwqCvCWm6pl6fcsqChZxi1uQMs=
+github.com/esrrhs/gohome v0.0.0-20261105235914-1c00731675b3 h1:cumdOqwg1EkT1axqF+xhPl8V4vMHu4JE7VzZ+h62/D0=
+github.com/esrrhs/gohome v0.0.0-20261105235914-1c00731675b3/go.mod h1:lW8YYqIHg13UePFzIQwqCvCWm6pl6fcsqChZxi1uQMs=
 github.com/golang/glog v0.0.0-20160126235308-23def4e6c14b/go.mod h1:SBH7ygxi8pfUlaOkMMuAQtPIUF8ecWP5IEl/CR7VP2Q=
 github.com/golang/mock v1.1.1/go.mod h1:oTYuIxOrZwtPieC+H1uAHpcLFnEyAGVDL/k47Jfbm0A=
 github.com/golang/protobuf v1.2.0/go.mod h1:6lQm79b+lXiMfvg/cZm0SGofjICqVBUtrP5yJMmIC1U=

@@ -76,7 +76,7 @@ func main() {
 	rdnsPSK := fs.String("rdnspsk", "", "RDNS underlay AES-GCM PSK payload encryption")
 	rdnsQueryType := fs.String("rdnsquerytype", "TXT", "RDNS query type: TXT (default) or NULL")
 	rdnsUpstream := fs.String("rdnsupstream", "", "RDNS upstream DNS server for non-tunnel queries")
-	key := fs.String("key", "fuckgcd", "obfuscation/encryption key")
+	key := fs.String("key", "", "obfuscation/encryption key")
 	debug := fs.Bool("debug", false, "enable debug logging and internal stat printing")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
