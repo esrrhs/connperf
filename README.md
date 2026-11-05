@@ -249,17 +249,17 @@ docker run --rm --network host esrrhs/connperf -s 127.0.0.1:8888 -p tcp -write
 
 ## Benchmark Comparison
 
-Measured on 2026-11-05. The client connected to the server across a transoceanic public internet link (client in East Asia, server in North America), sending one way for about 8 seconds with a fixed 1024-byte payload. The server verified every chunk.
+Measured on 2026-11-05. The benchmark was conducted across a transoceanic public internet link (client located in East Asia, server located in North America) with fixed 1024-byte payloads for about 8 seconds per protocol. Every transmitted chunk was verified for data integrity by the receiving endpoint. Both downstream (Server -> Client, typical proxy download flow) and upstream (Client -> Server) throughput were evaluated:
 
-| Protocol | Peak | Average | Verification |
+| Protocol | Downlink (Server -> Client) Peak / Avg | Uplink (Client -> Server) Peak / Avg | Verification |
 | :--- | :--- | :--- | :--- |
-| **kcp** | 19.12 MB/s (153 Mbps) | 15.53 MB/s | passed |
-| **quic** | 18.44 MB/s (147 Mbps) | 8.19 MB/s | passed |
-| **tcp** | 12.64 MB/s (101 Mbps) | 7.81 MB/s | passed |
-| **rudp** | 10.43 MB/s (83 Mbps) | 4.51 MB/s | passed |
-| **ricmp** | 10.83 MB/s (87 Mbps) | 3.60 MB/s | passed |
-| **rhttp** | 1.20 MB/s (9.6 Mbps) | 0.51 MB/s | passed |
-| **rdns** | 0.40 MB/s (3.2 Mbps) | 0.05 MB/s | passed |
+| **kcp** | 10.12 MB/s (81 Mbps) / 5.05 MB/s | 19.12 MB/s (153 Mbps) / 15.53 MB/s | passed |
+| **ricmp** | 11.08 MB/s (89 Mbps) / 5.49 MB/s | 10.83 MB/s (87 Mbps) / 3.60 MB/s | passed |
+| **rudp** | 10.00 MB/s (80 Mbps) / 3.57 MB/s | 10.43 MB/s (83 Mbps) / 4.51 MB/s | passed |
+| **tcp** | 3.77 MB/s (30 Mbps) / 1.97 MB/s | 12.64 MB/s (101 Mbps) / 7.81 MB/s | passed |
+| **quic** | 0.13 MB/s (1.0 Mbps) / 0.03 MB/s | 18.44 MB/s (147 Mbps) / 8.19 MB/s | passed |
+| **rhttp** | 0.10 MB/s (0.8 Mbps) / 0.04 MB/s | 1.20 MB/s (9.6 Mbps) / 0.51 MB/s | passed |
+| **rdns** | 0.40 MB/s (3.2 Mbps) / 0.06 MB/s | 0.40 MB/s (3.2 Mbps) / 0.05 MB/s | passed |
 
 ---
 
