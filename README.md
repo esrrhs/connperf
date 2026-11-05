@@ -9,13 +9,13 @@
 
 [中文说明](./README_ZH.md)
 
-`connperf` is a high-performance multi-protocol bandwidth and network performance benchmarking tool written in Go. It supports benchmarking across multiple reliable transport protocols: **TCP**, **RUDP**, **RICMP**, **KCP**, **QUIC**, and **RHTTP**.
+`connperf` is a high-performance multi-protocol bandwidth and network performance benchmarking tool written in Go. It supports benchmarking across multiple reliable transport protocols: **TCP**, **RUDP**, **RICMP**, **KCP**, **QUIC**, **RHTTP**, and **RDNS**.
 
 ---
 
 ## Features
 
-- **Multi-Protocol Support**: Benchmark across `tcp`, `rudp`, `ricmp`, `kcp`, `quic`, and `rhttp`.
+- **Multi-Protocol Support**: Benchmark across `tcp`, `rudp`, `ricmp`, `kcp`, `quic`, `rhttp`, and `rdns`.
 - **Directional & Full-Duplex Modes**: Supports separate `-write` (upload), `-read` (download), or bidirectional simultaneous testing.
 - **Fixed Payload Verification**: Sends a deterministic payload (default 1024 bytes) in a loop; the receiver validates every chunk (header region excluded when RTT headers are in use).
 - **Configurable Payload & Duration**: Customize payload size (`-buf`, bytes) and timed execution duration (`-t`).
@@ -25,7 +25,7 @@
 - **Throughput Units**: Choose `-unit MBps` (default, MiB/s), `Mbps`, or `Gbps` for periodic lines and the exit summary.
 - **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max and percentiles p50/p90/p99. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
-- **Auto Protocol Selection**: `-p auto` probes reliable protocols across a documented port map, prints a comparison table, and runs the full test on the winner (`-probe-t`, `-probe-only`, optional `-auto-ricmp`).
+- **Auto Protocol Selection**: `-p auto` probes reliable protocols across a documented port map, prints a comparison table, and runs the full test on the winner (`-probe-t`, `-probe-only`, optional `-auto-ricmp`, `-auto-rdns`).
 - **Graceful Shutdown**: Handles OS termination signals (`SIGINT`/`SIGTERM`) cleanly without losing exit statistics.
 - **Cross-Platform & Container-Ready**: Prebuilt binaries for Linux, macOS, Windows, and official Docker images.
 
@@ -64,7 +64,7 @@ Usage of connperf:
   -s string
         target server address (client mode, e.g. 1.2.3.4:8888)
   -p string
-        transport protocol: tcp, rudp, ricmp, kcp, quic, rhttp, or auto (default "tcp")
+        transport protocol: tcp, rudp, ricmp, kcp, quic, rhttp, rdns, or auto (default "tcp")
   -write
         enable write / sending mode
   -read
@@ -87,6 +87,16 @@ Usage of connperf:
         auto mode: print the probe comparison table and exit without a full run
   -auto-ricmp
         auto mode: include ricmp (needs root/CAP_NET_RAW; excluded by default)
+  -auto-rdns
+        auto mode: include rdns (requires -rdnsdomain; excluded by default)
+  -rdnsdomain string
+        RDNS base tunnel domain (e.g. tunnel.example.com; required when using rdns proto)
+  -rdnspsk string
+        RDNS underlay AES-GCM PSK payload encryption
+  -rdnsquerytype string
+        RDNS query type: TXT (default) or NULL
+  -rdnsupstream string
+        RDNS upstream DNS server for non-tunnel queries
   -v
         show concise version
   -version
@@ -169,12 +179,13 @@ Server listens on **multiple** reliable protocols using a fixed port map derived
 | **kcp** | `P + 2` |
 | **quic** | `P + 3` |
 | **rhttp** | `P + 4` |
+| **rdns** (opt-in) | `P + 5` (requires `-auto-rdns -rdnsdomain`) |
 | **ricmp** (opt-in) | host only (ICMP; no TCP/UDP port) |
 
-`ricmp` is **excluded by default** (raw sockets). Pass `-auto-ricmp` on both ends to include it.
+`ricmp` and `rdns` are **excluded by default**. Pass `-auto-ricmp` or `-auto-rdns -rdnsdomain <domain>` on both ends to include them.
 
 ```bash
-# Server: listen on base :8888 → tcp:8888, rudp:8889, kcp:8890, quic:8891, rhttp:8892
+# Server: listen on base :8888 → tcp:8888, rudp:8889, kcp:8890, quic:8891, rhttp:8892 (+ rdns:8893 if -auto-rdns)
 ./connperf -l :8888 -p auto -read
 
 # Client: probe each protocol, print table, then full 30s run on the winner
@@ -184,9 +195,9 @@ Server listens on **multiple** reliable protocols using a fixed port map derived
 ./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-only
 ```
 
-Open firewall ports `P` through `P+4` (and ICMP if using `-auto-ricmp`). Ensure nothing else binds those derived ports.
+Open firewall ports `P` through `P+5` (and ICMP if using `-auto-ricmp`). Ensure nothing else binds those derived ports.
 
-### 3. Alternative Protocols (e.g. KCP, RUDP, QUIC)
+### 3. Alternative Protocols (e.g. KCP, RUDP, QUIC, RDNS)
 
 * **KCP**:
 ```bash
@@ -204,6 +215,15 @@ Open firewall ports `P` through `P+4` (and ICMP if using `-auto-ricmp`). Ensure 
 
 # Client
 ./connperf -s 127.0.0.1:8888 -p rudp -write
+```
+
+* **RDNS** (DNS tunnel protocol; requires tunnel base domain):
+```bash
+# Server (listening on DNS port, e.g. :53 as root)
+./connperf -l :53 -p rdns -rdnsdomain tunnel.example.com -read
+
+# Client
+./connperf -s 1.2.3.4:53 -p rdns -rdnsdomain tunnel.example.com -write
 ```
 
 * **RICMP** (requires root/sudo privileges for raw socket handling):
@@ -229,16 +249,17 @@ docker run --rm --network host esrrhs/connperf -s 127.0.0.1:8888 -p tcp -write
 
 ## Benchmark Comparison
 
-Measured on 2026-09-19. The client connected directly to the server over a local 100 Mbps NIC (no VPN), sending one way for about 8 seconds with a fixed 64KB payload. The server verified every chunk. Peaks saturated the local NIC, so the average is a better picture of sustainable throughput on this path.
+Measured on 2026-11-05. The client connected to the server across a transoceanic public internet link (client in East Asia, server in North America), sending one way for about 8 seconds with a fixed 1024-byte payload. The server verified every chunk.
 
 | Protocol | Peak | Average | Verification |
 | :--- | :--- | :--- | :--- |
-| **tcp** | 11.31 MB/s (90 Mbps) | 4.91 MB/s | passed |
-| **rudp** | 9.69 MB/s (78 Mbps) | 6.16 MB/s | passed |
-| **ricmp** | 8.94 MB/s (72 Mbps) | 5.42 MB/s | passed |
-| **kcp** | 13.81 MB/s (110 Mbps) | 4.53 MB/s | passed |
-| **quic** | 12.50 MB/s (100 Mbps) | about 5.8 MB/s | passed |
-| **rhttp** | 1.06 MB/s (8.5 Mbps) | 0.23 MB/s | passed |
+| **kcp** | 19.12 MB/s (153 Mbps) | 15.53 MB/s | passed |
+| **quic** | 18.44 MB/s (147 Mbps) | 8.19 MB/s | passed |
+| **tcp** | 12.64 MB/s (101 Mbps) | 7.81 MB/s | passed |
+| **rudp** | 10.43 MB/s (83 Mbps) | 4.51 MB/s | passed |
+| **ricmp** | 10.83 MB/s (87 Mbps) | 3.60 MB/s | passed |
+| **rhttp** | 1.20 MB/s (9.6 Mbps) | 0.51 MB/s | passed |
+| **rdns** | 0.40 MB/s (3.2 Mbps) | 0.05 MB/s | passed |
 
 ---
 

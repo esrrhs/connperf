@@ -11,12 +11,16 @@ import (
 
 // reserveAutoBasePort finds a base port where base..base+4 are all free on 127.0.0.1.
 func reserveAutoBasePort(t *testing.T) int {
+	return reserveAutoBasePortN(t, 5)
+}
+
+func reserveAutoBasePortN(t *testing.T, count int) int {
 	t.Helper()
 	for attempt := 0; attempt < 50; attempt++ {
 		base := getFreePort(t)
 		ok := true
 		var listeners []net.Listener
-		for off := 0; off <= 4; off++ {
+		for off := 0; off < count; off++ {
 			ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", base+off))
 			if err != nil {
 				ok = false
@@ -49,11 +53,13 @@ func TestMapAutoAddrPortScheme(t *testing.T) {
 		{":8888", "kcp", false, ":8890"},
 		{":8888", "quic", false, ":8891"},
 		{":8888", "rhttp", false, ":8892"},
+		{":8888", "rdns", false, ":8893"},
 		{"127.0.0.1:9000", "tcp", false, "127.0.0.1:9000"},
 		{"127.0.0.1:9000", "rudp", false, "127.0.0.1:9001"},
 		{"127.0.0.1:9000", "kcp", false, "127.0.0.1:9002"},
 		{"127.0.0.1:9000", "quic", false, "127.0.0.1:9003"},
 		{"127.0.0.1:9000", "rhttp", false, "127.0.0.1:9004"},
+		{"127.0.0.1:9000", "rdns", false, "127.0.0.1:9005"},
 		{"127.0.0.1:9000", "ricmp", true, "127.0.0.1"},
 		{":9000", "ricmp", true, "0.0.0.0"},
 		{"192.168.1.1", "ricmp", true, "192.168.1.1"},
@@ -79,13 +85,16 @@ func TestMapAutoAddrErrors(t *testing.T) {
 	if _, err := mapAutoAddr(":65535", "rhttp", false); err == nil {
 		t.Fatal("expected overflow error for base+4")
 	}
+	if _, err := mapAutoAddr(":65535", "rdns", false); err == nil {
+		t.Fatal("expected overflow error for base+5")
+	}
 	if _, err := mapAutoAddr(":1000", "udp", false); err == nil {
 		t.Fatal("expected error for unmapped proto")
 	}
 }
 
 func TestAutoPortOffset(t *testing.T) {
-	want := map[string]int{"tcp": 0, "rudp": 1, "kcp": 2, "quic": 3, "rhttp": 4}
+	want := map[string]int{"tcp": 0, "rudp": 1, "kcp": 2, "quic": 3, "rhttp": 4, "rdns": 5}
 	for proto, off := range want {
 		got, ok := autoPortOffset(proto)
 		if !ok || got != off {
@@ -97,19 +106,27 @@ func TestAutoPortOffset(t *testing.T) {
 	}
 }
 
-func TestDefaultAutoProtosExcludesRICMP(t *testing.T) {
-	list := defaultAutoProtos(false)
+func TestDefaultAutoProtosExcludesRICMPAndRDNS(t *testing.T) {
+	list := defaultAutoProtos(false, false)
 	for _, s := range list {
-		if s.Proto == "ricmp" {
-			t.Fatal("ricmp should be excluded by default")
+		if s.Proto == "ricmp" || s.Proto == "rdns" {
+			t.Fatalf("ricmp and rdns should be excluded by default, found %s", s.Proto)
 		}
 	}
 	if len(list) != 5 {
 		t.Fatalf("len=%d want 5", len(list))
 	}
-	with := defaultAutoProtos(true)
-	if len(with) != 6 || with[5].Proto != "ricmp" || !with[5].HostOnly || !with[5].Optional {
-		t.Fatalf("unexpected with-ricmp list: %+v", with)
+	withRICMP := defaultAutoProtos(true, false)
+	if len(withRICMP) != 6 || withRICMP[5].Proto != "ricmp" || !withRICMP[5].HostOnly || !withRICMP[5].Optional {
+		t.Fatalf("unexpected with-ricmp list: %+v", withRICMP)
+	}
+	withRDNS := defaultAutoProtos(false, true)
+	if len(withRDNS) != 6 || withRDNS[5].Proto != "rdns" || withRDNS[5].Offset != 5 || !withRDNS[5].Optional {
+		t.Fatalf("unexpected with-rdns list: %+v", withRDNS)
+	}
+	withBoth := defaultAutoProtos(true, true)
+	if len(withBoth) != 7 {
+		t.Fatalf("unexpected with-both list length: %d", len(withBoth))
 	}
 }
 
@@ -262,5 +279,57 @@ func TestEndToEndAutoFullShort(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("auto server did not shut down in time")
+	}
+}
+
+func TestEndToEndAutoWithRDNS(t *testing.T) {
+	basePort := reserveAutoBasePortN(t, 6)
+	listen := fmt.Sprintf("127.0.0.1:%d", basePort)
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- run(serverCtx, Config{
+			Listen:     listen,
+			Proto:      "auto",
+			Read:       true,
+			BufSize:    1024,
+			Unit:       "MBps",
+			AutoRDNS:   true,
+			RdnsDomain: "tunnel.rdns.test",
+		})
+	}()
+
+	waitServerOrFail(t, serverDone, 500*time.Millisecond)
+
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer clientCancel()
+
+	err := run(clientCtx, Config{
+		Server:     listen,
+		Proto:      "auto",
+		Write:      true,
+		BufSize:    1024,
+		Unit:       "MBps",
+		ProbeTime:  time.Second,
+		ProbeOnly:  true,
+		Warmup:     0,
+		AutoRDNS:   true,
+		RdnsDomain: "tunnel.rdns.test",
+	})
+	if err != nil {
+		serverCancel()
+		t.Fatalf("auto probe-only with rdns failed: %v", err)
+	}
+
+	serverCancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("auto server with rdns failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("auto server with rdns did not shut down in time")
 	}
 }

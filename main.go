@@ -42,7 +42,12 @@ type Config struct {
 	MaxConn   int           // server accept limit (0 = unlimited)
 	ProbeTime time.Duration // auto-mode per-protocol probe window (-probe-t)
 	ProbeOnly bool          // auto-mode: print comparison table and exit
-	AutoRICMP bool          // auto-mode: include ricmp (excluded by default)
+	AutoRICMP     bool          // auto-mode: include ricmp (excluded by default)
+	AutoRDNS      bool          // auto-mode: include rdns (requires -rdnsdomain; excluded by default)
+	RdnsDomain    string        // RDNS base tunnel domain (required when proto is rdns)
+	RdnsPSK       string        // RDNS underlay AES-GCM PSK payload encryption
+	RdnsQueryType string        // RDNS query type: TXT (default) or NULL
+	RdnsUpstream  string        // RDNS upstream DNS server
 }
 
 func main() {
@@ -63,6 +68,11 @@ func main() {
 	probeSec := fs.Int("probe-t", 2, "auto mode: per-protocol probe duration in seconds (default 2)")
 	probeOnly := fs.Bool("probe-only", false, "auto mode: print probe comparison table and exit without full run")
 	autoRICMP := fs.Bool("auto-ricmp", false, "auto mode: include ricmp (needs root/CAP_NET_RAW; excluded by default)")
+	autoRDNS := fs.Bool("auto-rdns", false, "auto mode: include rdns (requires -rdnsdomain; excluded by default)")
+	rdnsDomain := fs.String("rdnsdomain", "", "RDNS base tunnel domain (e.g. rdns.bwh.esrrhs.xyz); required for rdns proto")
+	rdnsPSK := fs.String("rdnspsk", "", "RDNS underlay AES-GCM PSK payload encryption")
+	rdnsQueryType := fs.String("rdnsquerytype", "TXT", "RDNS query type: TXT (default) or NULL")
+	rdnsUpstream := fs.String("rdnsupstream", "", "RDNS upstream DNS server for non-tunnel queries")
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		fs.Usage()
@@ -122,27 +132,42 @@ func main() {
 		fs.Usage()
 		os.Exit(1)
 	}
-	if (*probeOnly || *autoRICMP) && !isAutoProto(*proto) {
-		fmt.Fprintf(os.Stderr, "error: -probe-only / -auto-ricmp require -p auto\n")
+	if (*probeOnly || *autoRICMP || *autoRDNS) && !isAutoProto(*proto) {
+		fmt.Fprintf(os.Stderr, "error: -probe-only / -auto-ricmp / -auto-rdns require -p auto\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if *proto == "rdns" && *rdnsDomain == "" {
+		fmt.Fprintf(os.Stderr, "error: -rdnsdomain is required when using rdns proto\n")
+		fs.Usage()
+		os.Exit(1)
+	}
+	if *autoRDNS && *rdnsDomain == "" {
+		fmt.Fprintf(os.Stderr, "error: -auto-rdns requires -rdnsdomain\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	cfg := Config{
-		Server:    *server,
-		Listen:    *listen,
-		Proto:     *proto,
-		Write:     *write,
-		Read:      *read,
-		BufSize:   *bufSize,
-		Duration:  time.Duration(*durationSec) * time.Second,
-		Unit:      normUnit,
-		Conns:     n,
-		Warmup:    time.Duration(*warmupSec) * time.Second,
-		MaxConn:   *maxConn,
-		ProbeTime: time.Duration(*probeSec) * time.Second,
-		ProbeOnly: *probeOnly,
-		AutoRICMP: *autoRICMP,
+		Server:        *server,
+		Listen:        *listen,
+		Proto:         *proto,
+		Write:         *write,
+		Read:          *read,
+		BufSize:       *bufSize,
+		Duration:      time.Duration(*durationSec) * time.Second,
+		Unit:          normUnit,
+		Conns:         n,
+		Warmup:        time.Duration(*warmupSec) * time.Second,
+		MaxConn:       *maxConn,
+		ProbeTime:     time.Duration(*probeSec) * time.Second,
+		ProbeOnly:     *probeOnly,
+		AutoRICMP:     *autoRICMP,
+		AutoRDNS:      *autoRDNS,
+		RdnsDomain:    *rdnsDomain,
+		RdnsPSK:       *rdnsPSK,
+		RdnsQueryType: *rdnsQueryType,
+		RdnsUpstream:  *rdnsUpstream,
 	}
 
 	if cfg.BufSize <= 0 {
@@ -206,6 +231,32 @@ func formatThroughput(bytes int64, sec float64, unit string) (value float64, lab
 	}
 }
 
+func newConn(proto string, cfg Config) (network.Conn, error) {
+	c, err := network.NewConn(proto)
+	if err != nil {
+		return nil, err
+	}
+	if c.Name() == "rdns" {
+		if rc, ok := c.(*network.RdnsConn); ok {
+			rcCfg := rc.GetConfig()
+			if cfg.RdnsDomain != "" {
+				rcCfg.Domain = cfg.RdnsDomain
+			}
+			if cfg.RdnsPSK != "" {
+				rcCfg.PSK = cfg.RdnsPSK
+			}
+			if cfg.RdnsQueryType != "" {
+				rcCfg.QueryType = cfg.RdnsQueryType
+			}
+			if cfg.RdnsUpstream != "" {
+				rcCfg.Upstream = cfg.RdnsUpstream
+			}
+			rc.SetConfig(rcCfg)
+		}
+	}
+	return c, nil
+}
+
 func run(ctx context.Context, cfg Config) error {
 	if isAutoProto(cfg.Proto) {
 		if cfg.Server != "" {
@@ -217,7 +268,7 @@ func run(ctx context.Context, cfg Config) error {
 		return nil
 	}
 
-	c, err := network.NewConn(cfg.Proto)
+	c, err := newConn(cfg.Proto, cfg)
 	if err != nil {
 		return fmt.Errorf("create conn %s failed: %w", cfg.Proto, err)
 	}
@@ -250,7 +301,7 @@ func runClient(ctx context.Context, factory network.Conn, cfg Config) error {
 		go func(i int) {
 			defer dialWG.Done()
 			// Fresh factory per dial so concurrent Dial on shared state cannot race.
-			f, err := network.NewConn(cfg.Proto)
+			f, err := newConn(cfg.Proto, cfg)
 			if err != nil {
 				results[i].err = err
 				return

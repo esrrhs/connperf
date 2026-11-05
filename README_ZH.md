@@ -9,13 +9,13 @@
 
 [English](./README.md)
 
-`connperf` 是一款基于 Go 语言编写的高性能多协议带宽与网络性能基准测试工具。支持对多种可靠传输协议进行吞吐量测试：**TCP**、**RUDP**、**RICMP**、**KCP**、**QUIC**、**RHTTP**。
+`connperf` 是一款基于 Go 语言编写的高性能多协议带宽与网络性能基准测试工具。支持对多种可靠传输协议进行吞吐量测试：**TCP**、**RUDP**、**RICMP**、**KCP**、**QUIC**、**RHTTP**、**RDNS**。
 
 ---
 
 ## 功能特性
 
-- **多协议支持**：支持 `tcp`、`rudp`、`ricmp`、`kcp`、`quic`、`rhttp` 多种可靠传输协议。
+- **多协议支持**：支持 `tcp`、`rudp`、`ricmp`、`kcp`、`quic`、`rhttp`、`rdns` 多种可靠传输协议。
 - **单向与全双工模式**：支持单独 `-write`（发送端测速）、单独 `-read`（接收端测速）或同时双向收发测试。
 - **固定内容校验**：循环发送确定性 payload（默认 1024 字节），接收端逐块校验内容是否一致（启用 RTT 头时校验跳过头部区域）。
 - **灵活的配置选项**：支持自定义 payload 大小（`-buf`，单位字节）与定时测试时长（`-t`）。
@@ -25,7 +25,7 @@
 - **吞吐单位**：通过 `-unit MBps`（默认，二进制 MiB/s）、`Mbps` 或 `Gbps` 选择周期输出与汇总的单位。
 - **RTT 与抖动**：双向（`-read -write`）模式下在 payload 前嵌入 16 字节小端头（`seq` + `send_ns`），对端在写路径上回显该头，发送端据此统计 RTT min/avg/max 以及百分位 p50/p90/p99；接收端同时输出近似 RFC3550 的到达间隔抖动。单向测试仅报告吞吐与接收抖动（RTT 需要双向，不会因此失败）。
 - **实时吞吐监控与汇总**：每秒输出实时速率，退出时打印总传输数据量与全程平均带宽。
-- **自动协议选择**：`-p auto` 按文档化端口映射探测各可靠协议，打印对比表，并在胜出协议上跑完整测试（`-probe-t`、`-probe-only`，可选 `-auto-ricmp`）。
+- **自动协议选择**：`-p auto` 按文档化端口映射探测各可靠协议，打印对比表，并在胜出协议上跑完整测试（`-probe-t`、`-probe-only`，可选 `-auto-ricmp`、`-auto-rdns`）。
 - **优雅退出处理**：捕获系统信号（`SIGINT`/`SIGTERM`），退出时不丢失统计数据并释放资源。
 - **跨平台与容器化支持**：提供 Linux、macOS、Windows 预编译二进制文件及 Docker 容器镜像。
 
@@ -64,7 +64,7 @@ Usage of connperf:
   -s string
         目标服务器地址（客户端模式，如 1.2.3.4:8888）
   -p string
-        传输协议类型：tcp, rudp, ricmp, kcp, quic, rhttp，或 auto（默认 "tcp"）
+        传输协议类型：tcp, rudp, ricmp, kcp, quic, rhttp, rdns，或 auto（默认 "tcp"）
   -write
         开启发送/写入模式
   -read
@@ -87,6 +87,16 @@ Usage of connperf:
         auto 模式：只打印探测对比表后退出，不跑完整测试
   -auto-ricmp
         auto 模式：纳入 ricmp（需要 root/CAP_NET_RAW；默认排除）
+  -auto-rdns
+        auto 模式：纳入 rdns（需要配置 -rdnsdomain；默认排除）
+  -rdnsdomain string
+        RDNS 基础隧道域名（例如 tunnel.example.com；使用 rdns 协议时必须配置）
+  -rdnspsk string
+        RDNS 底层 AES-GCM 载荷加密密钥（可选）
+  -rdnsquerytype string
+        RDNS DNS 查询类型：TXT（默认）或 NULL
+  -rdnsupstream string
+        RDNS 上游 DNS 服务器（保留供递归解析）
   -v
         显示简短版本号
   -version
@@ -169,12 +179,13 @@ read 880.00 MB/s jitter 12µs (verified 12345 chunks) 127.0.0.1:32758<--tcp-->12
 | **kcp** | `P + 2` |
 | **quic** | `P + 3` |
 | **rhttp** | `P + 4` |
+| **rdns**（可选） | `P + 5`（需配合 `-auto-rdns -rdnsdomain`） |
 | **ricmp**（可选） | 仅主机（ICMP；无 TCP/UDP 端口） |
 
-`ricmp` **默认排除**（原始套接字）。两端都加 `-auto-ricmp` 才会纳入。
+`ricmp` 与 `rdns` **默认排除**。两端都加 `-auto-ricmp` 或 `-auto-rdns -rdnsdomain <domain>` 才会纳入。
 
 ```bash
-# 服务端：基准 :8888 → tcp:8888, rudp:8889, kcp:8890, quic:8891, rhttp:8892
+# 服务端：基准 :8888 → tcp:8888, rudp:8889, kcp:8890, quic:8891, rhttp:8892 (加 -auto-rdns 则多 rdns:8893)
 ./connperf -l :8888 -p auto -read
 
 # 客户端：探测各协议并打印表格，再对胜出者跑 30 秒完整测试
@@ -184,9 +195,9 @@ read 880.00 MB/s jitter 12µs (verified 12345 chunks) 127.0.0.1:32758<--tcp-->12
 ./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-only
 ```
 
-请放行防火墙端口 `P` 到 `P+4`（若使用 `-auto-ricmp` 还需放行 ICMP），并确保派生端口未被占用。
+请放行防火墙端口 `P` 到 `P+5`（若使用 `-auto-ricmp` 还需放行 ICMP），并确保派生端口未被占用。
 
-### 3. 其他协议（KCP、RUDP、QUIC 等）
+### 3. 其他协议（KCP、RUDP、QUIC、RDNS 等）
 
 * **KCP**：
 ```bash
@@ -204,6 +215,15 @@ read 880.00 MB/s jitter 12µs (verified 12345 chunks) 127.0.0.1:32758<--tcp-->12
 
 # 客户端
 ./connperf -s 127.0.0.1:8888 -p rudp -write
+```
+
+* **RDNS**（DNS 隧道协议，需指定基础域名）：
+```bash
+# 服务端（监听 DNS 端口，如需 :53 可由 root 启动）
+./connperf -l :53 -p rdns -rdnsdomain tunnel.example.com -read
+
+# 客户端
+./connperf -s 1.2.3.4:53 -p rdns -rdnsdomain tunnel.example.com -write
 ```
 
 * **RICMP**（需 root/管理员权限操作原始套接字）：
@@ -229,16 +249,17 @@ docker run --rm --network host esrrhs/connperf -s 127.0.0.1:8888 -p tcp -write
 
 ## 协议速度对比
 
-2026-09-19，客户端经本地百兆网卡直连服务端（非 VPN），单向发送约 8 秒，固定 payload 64KB，服务端逐块校验内容。峰值已顶到本地网卡，平均速率更能代表这条链路的可持续带宽。
+2026-11-05，客户端经跨洲跨洋公网链路连接服务端（客户端位于东亚，服务端位于北美），单向发送约 8 秒，固定 payload 1024 字节，服务端逐块校验内容。
 
 | 协议 | 峰值 | 平均 | 校验 |
 | :--- | :--- | :--- | :--- |
-| **tcp** | 11.31 MB/s（90 Mbps） | 4.91 MB/s | 通过 |
-| **rudp** | 9.69 MB/s（78 Mbps） | 6.16 MB/s | 通过 |
-| **ricmp** | 8.94 MB/s（72 Mbps） | 5.42 MB/s | 通过 |
-| **kcp** | 13.81 MB/s（110 Mbps） | 4.53 MB/s | 通过 |
-| **quic** | 12.50 MB/s（100 Mbps） | 约 5.8 MB/s | 通过 |
-| **rhttp** | 1.06 MB/s（8.5 Mbps） | 0.23 MB/s | 通过 |
+| **kcp** | 19.12 MB/s（153 Mbps） | 15.53 MB/s | 通过 |
+| **quic** | 18.44 MB/s（147 Mbps） | 8.19 MB/s | 通过 |
+| **tcp** | 12.64 MB/s（101 Mbps） | 7.81 MB/s | 通过 |
+| **rudp** | 10.43 MB/s（83 Mbps） | 4.51 MB/s | 通过 |
+| **ricmp** | 10.83 MB/s（87 Mbps） | 3.60 MB/s | 通过 |
+| **rhttp** | 1.20 MB/s（9.6 Mbps） | 0.51 MB/s | 通过 |
+| **rdns** | 0.40 MB/s（3.2 Mbps） | 0.05 MB/s | 通过 |
 
 ---
 

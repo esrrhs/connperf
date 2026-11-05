@@ -20,15 +20,17 @@ import (
 //	kcp:   basePort + 2
 //	quic:  basePort + 3
 //	rhttp: basePort + 4
+//	rdns:  basePort + 5 (optional via -auto-rdns, requires -rdnsdomain)
 //	ricmp: host only (ICMP; no TCP/UDP port). Optional via -auto-ricmp.
 //
-// Example: -l :8888 → tcp :8888, rudp :8889, kcp :8890, quic :8891, rhttp :8892.
+// Example: -l :8888 → tcp :8888, rudp :8889, kcp :8890, quic :8891, rhttp :8892, rdns :8893.
 const (
 	autoOffsetTCP   = 0
 	autoOffsetRUDP  = 1
 	autoOffsetKCP   = 2
 	autoOffsetQUIC  = 3
 	autoOffsetRHTTP = 4
+	autoOffsetRDNS  = 5
 )
 
 // autoProtoSpec describes one candidate protocol in -p auto mode.
@@ -40,14 +42,17 @@ type autoProtoSpec struct {
 }
 
 // defaultAutoProtos is the ordered candidate list. ricmp is appended only when
-// includeRICMP is true.
-func defaultAutoProtos(includeRICMP bool) []autoProtoSpec {
+// includeRICMP is true; rdns is appended only when includeRDNS is true.
+func defaultAutoProtos(includeRICMP, includeRDNS bool) []autoProtoSpec {
 	out := []autoProtoSpec{
 		{Proto: "tcp", Offset: autoOffsetTCP},
 		{Proto: "rudp", Offset: autoOffsetRUDP},
 		{Proto: "kcp", Offset: autoOffsetKCP},
 		{Proto: "quic", Offset: autoOffsetQUIC},
 		{Proto: "rhttp", Offset: autoOffsetRHTTP},
+	}
+	if includeRDNS {
+		out = append(out, autoProtoSpec{Proto: "rdns", Offset: autoOffsetRDNS, Optional: true})
 	}
 	if includeRICMP {
 		out = append(out, autoProtoSpec{Proto: "ricmp", HostOnly: true, Optional: true})
@@ -69,6 +74,8 @@ func autoPortOffset(proto string) (int, bool) {
 		return autoOffsetQUIC, true
 	case "rhttp":
 		return autoOffsetRHTTP, true
+	case "rdns":
+		return autoOffsetRDNS, true
 	default:
 		return 0, false
 	}
@@ -173,7 +180,7 @@ func formatProbeTable(results []probeResult, unit string, winner int) string {
 
 // probeWriteAvg dials proto/addr and measures average write throughput over
 // probeDur after discarding warmup. Uses a single connection and fixed payload.
-func probeWriteAvg(parent context.Context, proto, addr string, bufSize int, probeDur, warmup time.Duration) probeResult {
+func probeWriteAvg(parent context.Context, proto, addr string, bufSize int, probeDur, warmup time.Duration, cfg Config) probeResult {
 	res := probeResult{Proto: proto, Addr: addr}
 	if bufSize <= 0 {
 		bufSize = defaultPayloadSize
@@ -187,7 +194,7 @@ func probeWriteAvg(parent context.Context, proto, addr string, bufSize int, prob
 	ctx, cancel := context.WithTimeout(parent, total+2*time.Second)
 	defer cancel()
 
-	factory, err := network.NewConn(proto)
+	factory, err := newConn(proto, cfg)
 	if err != nil {
 		res.Err = err
 		return res
@@ -273,8 +280,11 @@ func probeWriteAvg(parent context.Context, proto, addr string, bufSize int, prob
 }
 
 func runAutoServer(ctx context.Context, cfg Config) error {
-	protos := defaultAutoProtos(cfg.AutoRICMP)
+	protos := defaultAutoProtos(cfg.AutoRICMP, cfg.AutoRDNS)
 	fmt.Printf("auto server: base listen %s; port map tcp=+0 rudp=+1 kcp=+2 quic=+3 rhttp=+4", cfg.Listen)
+	if cfg.AutoRDNS {
+		fmt.Printf(" rdns=+%d", autoOffsetRDNS)
+	}
 	if cfg.AutoRICMP {
 		fmt.Printf(" ricmp=host-only")
 	} else {
@@ -321,7 +331,7 @@ func runAutoServer(ctx context.Context, cfg Config) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			f, err := network.NewConn(proto)
+			f, err := newConn(proto, child)
 			if err != nil {
 				if optional {
 					fmt.Printf("auto: skip %s: %v\n", proto, err)
@@ -468,7 +478,7 @@ func runAutoServer(ctx context.Context, cfg Config) error {
 }
 
 func runAutoClient(ctx context.Context, cfg Config) error {
-	protos := defaultAutoProtos(cfg.AutoRICMP)
+	protos := defaultAutoProtos(cfg.AutoRICMP, cfg.AutoRDNS)
 	probeDur := cfg.ProbeTime
 	if probeDur <= 0 {
 		probeDur = 2 * time.Second
@@ -488,7 +498,7 @@ func runAutoClient(ctx context.Context, cfg Config) error {
 			continue
 		}
 		fmt.Printf("auto: probing %s %s ...\n", spec.Proto, addr)
-		r := probeWriteAvg(ctx, spec.Proto, addr, cfg.BufSize, probeDur, cfg.Warmup)
+		r := probeWriteAvg(ctx, spec.Proto, addr, cfg.BufSize, probeDur, cfg.Warmup, cfg)
 		r.Proto = spec.Proto
 		r.Addr = addr
 		results = append(results, r)
@@ -512,7 +522,7 @@ func runAutoClient(ctx context.Context, cfg Config) error {
 	full.Proto = w.Proto
 	full.Server = w.Addr
 	full.Listen = ""
-	factory, err := network.NewConn(full.Proto)
+	factory, err := newConn(full.Proto, full)
 	if err != nil {
 		return err
 	}

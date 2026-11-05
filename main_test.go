@@ -282,11 +282,12 @@ func runEndToEndProto(t *testing.T, proto, listenAddr, dialAddr string) {
 	defer serverCancel()
 
 	serverCfg := Config{
-		Listen:  listenAddr,
-		Proto:   proto,
-		Read:    true,
-		BufSize: 1024,
-		Unit:    "MBps",
+		Listen:     listenAddr,
+		Proto:      proto,
+		Read:       true,
+		BufSize:    1024,
+		Unit:       "MBps",
+		RdnsDomain: "tunnel.rdns.test",
 	}
 
 	serverDone := make(chan error, 1)
@@ -302,12 +303,13 @@ func runEndToEndProto(t *testing.T, proto, listenAddr, dialAddr string) {
 	defer clientCancel()
 
 	clientCfg := Config{
-		Server:   dialAddr,
-		Proto:    proto,
-		Write:    true,
-		BufSize:  1024,
-		Duration: 1 * time.Second,
-		Unit:     "MBps",
+		Server:     dialAddr,
+		Proto:      proto,
+		Write:      true,
+		BufSize:    1024,
+		Duration:   1 * time.Second,
+		Unit:       "MBps",
+		RdnsDomain: "tunnel.rdns.test",
 	}
 
 	if err := run(clientCtx, clientCfg); err != nil {
@@ -405,6 +407,67 @@ func TestEndToEndRHTTP(t *testing.T) {
 	port := getFreePort(t)
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
 	runEndToEndProto(t, "rhttp", addr, addr)
+}
+
+func TestEndToEndRDNS(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	runEndToEndProto(t, "rdns", addr, addr)
+}
+
+func TestEndToEndRDNS_PSK_Null(t *testing.T) {
+	port := getFreePort(t)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	serverCfg := Config{
+		Listen:        addr,
+		Proto:         "rdns",
+		Read:          true,
+		BufSize:       1024,
+		Unit:          "MBps",
+		RdnsDomain:    "null.rdns.test",
+		RdnsPSK:       "testpsk123",
+		RdnsQueryType: "NULL",
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- run(serverCtx, serverCfg)
+	}()
+
+	waitServerOrFail(t, serverDone, 200*time.Millisecond)
+
+	clientCtx, clientCancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer clientCancel()
+
+	clientCfg := Config{
+		Server:        addr,
+		Proto:         "rdns",
+		Write:         true,
+		BufSize:       1024,
+		Duration:      1 * time.Second,
+		Unit:          "MBps",
+		RdnsDomain:    "null.rdns.test",
+		RdnsPSK:       "testpsk123",
+		RdnsQueryType: "NULL",
+	}
+
+	if err := run(clientCtx, clientCfg); err != nil {
+		t.Fatalf("client rdns PSK run failed: %v", err)
+	}
+
+	serverCancel()
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatalf("server rdns PSK run failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("server rdns PSK did not shut down in time")
+	}
 }
 
 // TestEndToEndRICMP exercises ICMP-based transport. Raw ip4:icmp sockets need
