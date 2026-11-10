@@ -208,14 +208,15 @@ func TestEndToEndAutoProbeOnly(t *testing.T) {
 	defer clientCancel()
 
 	err := run(clientCtx, Config{
-		Server:    listen,
-		Proto:     "auto",
-		Write:     true,
-		BufSize:   1024,
-		Unit:      "MBps",
-		ProbeTime: time.Second,
-		ProbeOnly: true,
-		Warmup:    0,
+		Server:      listen,
+		Proto:       "auto",
+		Write:       true,
+		BufSize:     1024,
+		Unit:        "MBps",
+		ProbeTime:   100 * time.Millisecond,
+		ProbeRounds: 2,
+		ProbeOnly:   true,
+		Warmup:      0,
 	})
 	if err != nil {
 		serverCancel()
@@ -257,14 +258,15 @@ func TestEndToEndAutoFullShort(t *testing.T) {
 	defer clientCancel()
 
 	err := run(clientCtx, Config{
-		Server:    listen,
-		Proto:     "auto",
-		Write:     true,
-		BufSize:   1024,
-		Unit:      "MBps",
-		ProbeTime: time.Second,
-		Duration:  time.Second,
-		Conns:     1,
+		Server:      listen,
+		Proto:       "auto",
+		Write:       true,
+		BufSize:     1024,
+		Unit:        "MBps",
+		ProbeTime:   100 * time.Millisecond,
+		ProbeRounds: 2,
+		Duration:    time.Second,
+		Conns:       1,
 	})
 	if err != nil {
 		serverCancel()
@@ -307,16 +309,17 @@ func TestEndToEndAutoWithRDNS(t *testing.T) {
 	defer clientCancel()
 
 	err := run(clientCtx, Config{
-		Server:     listen,
-		Proto:      "auto",
-		Write:      true,
-		BufSize:    1024,
-		Unit:       "MBps",
-		ProbeTime:  time.Second,
-		ProbeOnly:  true,
-		Warmup:     0,
-		AutoRDNS:   true,
-		RdnsDomain: "tunnel.rdns.test",
+		Server:      listen,
+		Proto:       "auto",
+		Write:       true,
+		BufSize:     1024,
+		Unit:        "MBps",
+		ProbeTime:   100 * time.Millisecond,
+		ProbeRounds: 2,
+		ProbeOnly:   true,
+		Warmup:      0,
+		AutoRDNS:    true,
+		RdnsDomain:  "tunnel.rdns.test",
 	})
 	if err != nil {
 		serverCancel()

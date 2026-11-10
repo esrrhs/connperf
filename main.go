@@ -30,26 +30,29 @@ const (
 )
 
 type Config struct {
-	Server    string
-	Listen    string
-	Proto     string
-	Write     bool
-	Read      bool
-	BufSize   int
-	Duration  time.Duration
-	Unit      string // MBps (default), Mbps, Gbps
-	Conns     int    // client parallel connections (-n), default 1
-	Warmup    time.Duration
-	MaxConn   int           // server accept limit (0 = unlimited)
-	ProbeTime time.Duration // auto-mode per-protocol probe window (-probe-t)
-	ProbeOnly bool          // auto-mode: print comparison table and exit
-	AutoRICMP     bool          // auto-mode: include ricmp (excluded by default)
-	AutoRDNS      bool          // auto-mode: include rdns (requires -rdnsdomain; excluded by default)
-	RdnsDomain    string        // RDNS base tunnel domain (required when proto is rdns)
-	RdnsPSK       string        // RDNS underlay AES-GCM PSK payload encryption
-	RdnsQueryType string        // RDNS query type: TXT (default) or NULL
-	RdnsUpstream  string        // RDNS upstream DNS server
-	Key           string        // obfuscation/encryption key
+	Server        string
+	Listen        string
+	Proto         string
+	Write         bool
+	Read          bool
+	BufSize       int
+	Duration      time.Duration
+	Unit          string // MBps (default), Mbps, Gbps
+	Conns         int    // client parallel connections (-n), default 1
+	Warmup        time.Duration
+	MaxConn       int           // server accept limit (0 = unlimited)
+	ProbeTime     time.Duration // auto-mode per-protocol probe window (-probe-t)
+	ProbeRounds   int           // auto rounds per protocol; 0 means default 3
+	autoHub       *probeHub
+	autoTransport bool   // framed auto full-run connection
+	ProbeOnly     bool   // auto-mode: print comparison table and exit
+	AutoRICMP     bool   // auto-mode: include ricmp (excluded by default)
+	AutoRDNS      bool   // auto-mode: include rdns (requires -rdnsdomain; excluded by default)
+	RdnsDomain    string // RDNS base tunnel domain (required when proto is rdns)
+	RdnsPSK       string // RDNS underlay AES-GCM PSK payload encryption
+	RdnsQueryType string // RDNS query type: TXT (default) or NULL
+	RdnsUpstream  string // RDNS upstream DNS server
+	Key           string // obfuscation/encryption key
 	Debug         bool
 }
 
@@ -68,7 +71,8 @@ func main() {
 	conns := fs.Int("n", 1, "client parallel connections (default 1)")
 	warmupSec := fs.Int("warmup", 0, "seconds of traffic ignored in stats (discard counters)")
 	maxConn := fs.Int("maxconn", 0, "server max accepted connections (0 = unlimited)")
-	probeSec := fs.Int("probe-t", 2, "auto mode: per-protocol probe duration in seconds (default 2)")
+	probeSec := fs.Int("probe-t", 2, "auto mode: per-round sending duration in seconds (1..60, default 2)")
+	probeRounds := fs.Int("probe-rounds", 3, "auto mode: rounds per protocol (1..100), randomized/interleaved; rank median receiver goodput")
 	probeOnly := fs.Bool("probe-only", false, "auto mode: print probe comparison table and exit without full run")
 	autoRICMP := fs.Bool("auto-ricmp", false, "auto mode: include ricmp (needs root/CAP_NET_RAW; excluded by default)")
 	autoRDNS := fs.Bool("auto-rdns", false, "auto mode: include rdns (requires -rdnsdomain; excluded by default)")
@@ -132,6 +136,10 @@ func main() {
 		fs.Usage()
 		os.Exit(1)
 	}
+	if *probeRounds < 1 || *probeRounds > 100 {
+		fmt.Fprintln(os.Stderr, "error: -probe-rounds must be 1..100")
+		os.Exit(1)
+	}
 	if *probeSec < 1 {
 		fmt.Fprintf(os.Stderr, "error: -probe-t must be >= 1\n")
 		fs.Usage()
@@ -166,6 +174,7 @@ func main() {
 		Warmup:        time.Duration(*warmupSec) * time.Second,
 		MaxConn:       *maxConn,
 		ProbeTime:     time.Duration(*probeSec) * time.Second,
+		ProbeRounds:   *probeRounds,
 		ProbeOnly:     *probeOnly,
 		AutoRICMP:     *autoRICMP,
 		AutoRDNS:      *autoRDNS,
@@ -328,12 +337,19 @@ func runClient(ctx context.Context, factory network.Conn, cfg Config) error {
 		go func(i int) {
 			defer dialWG.Done()
 			// Fresh factory per dial so concurrent Dial on shared state cannot race.
-			f, err := newConn(cfg.Proto, cfg)
+			f, err := newAutoOrNormalConn(cfg.Proto, cfg)
 			if err != nil {
 				results[i].err = err
 				return
 			}
 			conn, err := f.Dial(cfg.Server)
+			if err == nil && cfg.autoTransport {
+				err = autoFullHandshake(ctx, conn)
+				if err != nil {
+					_ = conn.Close()
+					conn = nil
+				}
+			}
 			results[i] = dialResult{conn: conn, err: err}
 		}(i)
 	}
@@ -451,7 +467,7 @@ func makePayload(size int) []byte {
 	return p
 }
 
-func writeFull(c network.Conn, buf []byte) (int, error) {
+func writeFull(c io.Writer, buf []byte) (int, error) {
 	total := 0
 	for total < len(buf) {
 		n, err := c.Write(buf[total:])

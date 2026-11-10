@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand/v2"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -139,6 +141,7 @@ type probeResult struct {
 	AvgBps  float64 // bytes/sec after warmup; 0 if failed
 	Bytes   int64
 	Elapsed time.Duration
+	Samples []probeResult
 	Err     error
 }
 
@@ -147,7 +150,7 @@ type probeResult struct {
 func selectProbeWinner(results []probeResult) int {
 	best := -1
 	for i, r := range results {
-		if r.Err != nil {
+		if r.Err != nil || r.AvgBps <= 0 {
 			continue
 		}
 		if best < 0 || r.AvgBps > results[best].AvgBps {
@@ -160,126 +163,39 @@ func selectProbeWinner(results []probeResult) int {
 func formatProbeTable(results []probeResult, unit string, winner int) string {
 	var b strings.Builder
 	b.WriteString("auto probe comparison:\n")
-	b.WriteString(fmt.Sprintf("%-8s %-22s %12s %10s %s\n", "PROTO", "ADDR", "AVG", "BYTES", "STATUS"))
+	b.WriteString(fmt.Sprintf("%-8s %-22s %12s %10s %s\n", "PROTO", "ADDR", "MEDIAN", "VALID", "STATUS"))
 	for i, r := range results {
+		valid := 0
+		for _, sample := range r.Samples {
+			if sample.Err == nil && sample.AvgBps > 0 {
+				valid++
+			}
+		}
+		validity := fmt.Sprintf("%d/%d", valid, len(r.Samples))
 		mark := ""
 		if i == winner {
 			mark = " <-- winner"
 		}
 		if r.Err != nil {
 			b.WriteString(fmt.Sprintf("%-8s %-22s %12s %10s FAIL: %v%s\n",
-				r.Proto, r.Addr, "-", "-", r.Err, mark))
+				r.Proto, r.Addr, "-", validity, r.Err, mark))
+			for j, sample := range r.Samples {
+				fmt.Fprintf(&b, "  round %d: bytes=%d elapsed=%s receiver_Bps=%.2f valid=%t error=%v\n", j+1, sample.Bytes, sample.Elapsed, sample.AvgBps, sample.Err == nil && sample.AvgBps > 0, sample.Err)
+			}
 			continue
 		}
-		val, lbl := formatThroughput(r.Bytes, r.Elapsed.Seconds(), unit)
-		b.WriteString(fmt.Sprintf("%-8s %-22s %8.2f %-4s %10d OK%s\n",
-			r.Proto, r.Addr, val, lbl, r.Bytes, mark))
+		val, lbl := formatThroughput(1000000, 1000000/r.AvgBps, unit)
+		b.WriteString(fmt.Sprintf("%-8s %-22s %8.2f %-4s %10s OK%s\n",
+			r.Proto, r.Addr, val, lbl, validity, mark))
+		for j, sample := range r.Samples {
+			fmt.Fprintf(&b, "  round %d: bytes=%d elapsed=%s receiver_Bps=%.2f valid=%t error=%v\n", j+1, sample.Bytes, sample.Elapsed, sample.AvgBps, sample.Err == nil && sample.AvgBps > 0, sample.Err)
+		}
 	}
 	return b.String()
 }
 
-// probeWriteAvg dials proto/addr and measures average write throughput over
-// probeDur after discarding warmup. Uses a single connection and fixed payload.
-func probeWriteAvg(parent context.Context, proto, addr string, bufSize int, probeDur, warmup time.Duration, cfg Config) probeResult {
-	res := probeResult{Proto: proto, Addr: addr}
-	if bufSize <= 0 {
-		bufSize = defaultPayloadSize
-	}
-	if probeDur <= 0 {
-		res.Err = fmt.Errorf("probe duration must be > 0")
-		return res
-	}
-
-	total := probeDur + warmup
-	ctx, cancel := context.WithTimeout(parent, total+2*time.Second)
-	defer cancel()
-
-	factory, err := newConn(proto, cfg)
-	if err != nil {
-		res.Err = err
-		return res
-	}
-	conn, err := factory.Dial(addr)
-	if err != nil {
-		res.Err = fmt.Errorf("dial: %w", err)
-		return res
-	}
-	var closeOnce sync.Once
-	closeConn := func() {
-		closeOnce.Do(func() { _ = conn.Close() })
-	}
-	defer closeConn()
-
-	go func() {
-		<-ctx.Done()
-		closeConn()
-	}()
-
-	payload := makePayload(bufSize)
-	var written atomic.Int64
-	start := time.Now()
-	statsStart := start.Add(warmup)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, bufSize)
-		copy(buf, payload)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			n, werr := writeFull(conn, buf)
-			now := time.Now()
-			if n > 0 && !now.Before(statsStart) {
-				written.Add(int64(n))
-			}
-			if werr != nil {
-				return
-			}
-		}
-	}()
-
-	timer := time.NewTimer(total)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		cancel()
-	case <-parent.Done():
-		cancel()
-	case <-ctx.Done():
-	}
-	closeConn()
-	// Some protocols (e.g. quic) may block in Write past Close; do not hang the probe.
-	select {
-	case <-done:
-	case <-time.After(1500 * time.Millisecond):
-	}
-
-	elapsed := time.Since(statsStart)
-	if elapsed < 0 {
-		elapsed = 0
-	}
-	if elapsed > probeDur+50*time.Millisecond {
-		elapsed = probeDur
-	}
-	res.Bytes = written.Load()
-	res.Elapsed = elapsed
-	if elapsed <= 0 || res.Bytes == 0 {
-		if parent.Err() != nil {
-			res.Err = parent.Err()
-			return res
-		}
-		res.Err = fmt.Errorf("no bytes written during probe")
-		return res
-	}
-	res.AvgBps = float64(res.Bytes) / elapsed.Seconds()
-	return res
-}
-
 func runAutoServer(ctx context.Context, cfg Config) error {
+	cfg.autoHub = &probeHub{sessions: make(map[[16]byte]*probeSession)}
 	protos := defaultAutoProtos(cfg.AutoRICMP, cfg.AutoRDNS)
 	fmt.Printf("auto server: base listen %s; port map tcp=+0 rudp=+1 kcp=+2 quic=+3 rhttp=+4", cfg.Listen)
 	if cfg.AutoRDNS {
@@ -331,7 +247,7 @@ func runAutoServer(ctx context.Context, cfg Config) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			f, err := newConn(proto, child)
+			f, err := newAutoConn(proto, child)
 			if err != nil {
 				if optional {
 					fmt.Printf("auto: skip %s: %v\n", proto, err)
@@ -366,10 +282,13 @@ func runAutoServer(ctx context.Context, cfg Config) error {
 				closeOnce.Do(func() { _ = server.Close() })
 			}
 			defer closeServer()
+			listenerDone := make(chan struct{})
 			go func() {
+				defer close(listenerDone)
 				<-subCtx.Done()
 				closeServer()
 			}()
+			defer func() { subCancel(); closeServer(); <-listenerDone }()
 
 			maxNote := "unlimited"
 			if child.MaxConn > 0 {
@@ -379,27 +298,17 @@ func runAutoServer(ctx context.Context, cfg Config) error {
 				listen, proto, child.BufSize, maxNote)
 
 			var (
-				awg      sync.WaitGroup
-				aErrOnce sync.Once
-				aErr     error
-				active   atomic.Int64
+				awg    sync.WaitGroup
+				active atomic.Int64
 			)
-			setAErr := func(e error) {
-				if e == nil {
-					return
-				}
-				aErrOnce.Do(func() { aErr = e })
-			}
 
+			defer func() { subCancel(); awg.Wait() }()
 			for {
 				sonny, err := server.Accept()
 				if err != nil {
 					select {
 					case <-subCtx.Done():
 						awg.Wait()
-						if aErr != nil && ctx.Err() == nil {
-							setErr(fmt.Errorf("%s: %w", proto, aErr))
-						}
 						return
 					default:
 					}
@@ -417,14 +326,10 @@ func runAutoServer(ctx context.Context, cfg Config) error {
 				go func(conn network.Conn) {
 					defer awg.Done()
 					defer active.Add(-1)
-					defer conn.Close()
-					connCtx, connCancel := context.WithCancel(subCtx)
-					defer connCancel()
-					go func() {
-						<-connCtx.Done()
-						_ = conn.Close()
-					}()
-					setAErr(showMany(connCtx, []network.Conn{conn}, child))
+					// Probe failures are local to a sample, not fatal to the listener.
+					if err := serveAutoConn(subCtx, conn, child); err != nil && subCtx.Err() == nil {
+						fmt.Printf("auto %s connection: %v\n", proto, err)
+					}
 				}(sonny)
 			}
 		}()
@@ -484,24 +389,45 @@ func runAutoClient(ctx context.Context, cfg Config) error {
 		probeDur = 2 * time.Second
 	}
 
-	fmt.Printf("auto client: probing %d protocol(s) for %s (warmup %s) against base %s\n",
-		len(protos), probeDur, cfg.Warmup, cfg.Server)
+	size := cfg.BufSize
+	if size <= 0 {
+		size = defaultPayloadSize
+	}
+	if err := validateProbe(size, probeDur, cfg.Warmup); err != nil {
+		return err
+	}
 
-	results := make([]probeResult, 0, len(protos))
-	for _, spec := range protos {
-		if ctx.Err() != nil {
-			break
-		}
+	rounds := cfg.ProbeRounds
+	if rounds == 0 {
+		rounds = 3
+	}
+	if rounds < 1 || rounds > 100 {
+		return fmt.Errorf("-probe-rounds must be 1..100")
+	}
+	fmt.Printf("auto client: %d rounds x %d protocols, randomized/interleaved; median receiver goodput, duration %s warmup %s base %s\n", rounds, len(protos), probeDur, cfg.Warmup, cfg.Server)
+	results := make([]probeResult, len(protos))
+	for i, spec := range protos {
 		addr, err := mapAutoAddr(cfg.Server, spec.Proto, spec.HostOnly)
-		if err != nil {
-			results = append(results, probeResult{Proto: spec.Proto, Err: err})
-			continue
+		results[i] = probeResult{Proto: spec.Proto, Addr: addr, Err: err}
+	}
+	schedule := probeSchedule(len(protos), rounds, rand.Shuffle)
+	for _, i := range schedule {
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
-		fmt.Printf("auto: probing %s %s ...\n", spec.Proto, addr)
-		r := probeWriteAvg(ctx, spec.Proto, addr, cfg.BufSize, probeDur, cfg.Warmup, cfg)
-		r.Proto = spec.Proto
-		r.Addr = addr
-		results = append(results, r)
+		r := &results[i]
+		sample := probeResult{Proto: r.Proto, Addr: r.Addr, Err: r.Err}
+		if r.Err == nil {
+			fmt.Printf("auto: probing %s round %d/%d %s ...\n", r.Proto, len(r.Samples)+1, rounds, r.Addr)
+			sample = probeReceiverGoodput(ctx, r.Proto, r.Addr, cfg.BufSize, probeDur, cfg.Warmup, cfg)
+		}
+		r.Samples = append(r.Samples, sample)
+	}
+	for i := range results {
+		summarizeProbe(&results[i], rounds)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 
 	winner := selectProbeWinner(results)
@@ -519,10 +445,11 @@ func runAutoClient(ctx context.Context, cfg Config) error {
 	fmt.Printf("auto: selected %s → full test on %s\n", w.Proto, w.Addr)
 
 	full := cfg
+	full.autoTransport = true
 	full.Proto = w.Proto
 	full.Server = w.Addr
 	full.Listen = ""
-	factory, err := newConn(full.Proto, full)
+	factory, err := newAutoConn(full.Proto, full)
 	if err != nil {
 		return err
 	}
@@ -537,4 +464,40 @@ func runAutoClient(ctx context.Context, cfg Config) error {
 
 func isAutoProto(p string) bool {
 	return strings.EqualFold(strings.TrimSpace(p), "auto")
+}
+
+// One randomized permutation per round interleaves protocols instead of
+// completing all repeats of a protocol together. Ties retain candidate order.
+func probeSchedule(n, rounds int, shuffle func(int, func(int, int))) []int {
+	out := make([]int, 0, n*rounds)
+	for r := 0; r < rounds; r++ {
+		order := make([]int, n)
+		for i := range order {
+			order[i] = i
+		}
+		shuffle(n, func(i, j int) { order[i], order[j] = order[j], order[i] })
+		out = append(out, order...)
+	}
+	return out
+}
+
+func summarizeProbe(r *probeResult, rounds int) {
+	var valid []probeResult
+	for _, s := range r.Samples {
+		if s.Err == nil && s.AvgBps > 0 {
+			valid = append(valid, s)
+		}
+	}
+	// Require a strict majority; a lone lucky sample cannot beat reliable peers.
+	if len(valid) < rounds/2+1 {
+		r.Err = fmt.Errorf("only %d/%d valid receiver reports (majority required)", len(valid), rounds)
+		return
+	}
+	sort.Slice(valid, func(i, j int) bool { return valid[i].AvgBps < valid[j].AvgBps })
+	mid := len(valid) / 2
+	r.AvgBps = valid[mid].AvgBps
+	if len(valid)%2 == 0 {
+		r.AvgBps = (valid[mid-1].AvgBps + r.AvgBps) / 2
+	}
+	r.Bytes, r.Elapsed, r.Err = valid[mid].Bytes, valid[mid].Elapsed, nil
 }

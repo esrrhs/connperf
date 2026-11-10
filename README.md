@@ -25,7 +25,7 @@
 - **Throughput Units**: Choose `-unit MBps` (default, MiB/s), `Mbps`, or `Gbps` for periodic lines and the exit summary.
 - **RTT & Jitter**: In bidirectional (`-read -write`) mode, embeds a 16-byte little-endian header (`seq` + `send_ns`); the peer echoes it on its write path so the sender can report RTT min/avg/max and percentiles p50/p90/p99. Receivers also report RFC3550-ish inter-arrival jitter. One-way tests report throughput + receive jitter only (RTT needs bidirectional; the run does not fail).
 - **Real-Time Throughput & Exit Summary**: Periodic throughput monitoring along with aggregate transfer and average speed summary on exit.
-- **Auto Protocol Selection**: `-p auto` probes reliable protocols across a documented port map, prints a comparison table, and runs the full test on the winner (`-probe-t`, `-probe-only`, optional `-auto-ricmp`, `-auto-rdns`).
+- **Auto Protocol Selection**: `-p auto` probes reliable protocols across a documented port map, prints a comparison table, and runs the full test on the winner (`-probe-t`, `-probe-rounds`, `-probe-only`, optional `-auto-ricmp`, `-auto-rdns`).
 - **Graceful Shutdown**: Handles OS termination signals (`SIGINT`/`SIGTERM`) cleanly without losing exit statistics.
 - **Cross-Platform & Container-Ready**: Prebuilt binaries for Linux, macOS, Windows, and official Docker images.
 
@@ -82,7 +82,9 @@ Usage of connperf:
   -maxconn int
         server max accepted connections (0 = unlimited)
   -probe-t int
-        auto mode: per-protocol probe duration in seconds (default 2)
+        auto mode: per-round sending duration in seconds (1..60, default 2)
+  -probe-rounds int
+        auto mode: repeats per protocol (1..100, default 3), randomized/interleaved; rank median receiver goodput
   -probe-only
         auto mode: print the probe comparison table and exit without a full run
   -auto-ricmp
@@ -168,7 +170,17 @@ Periodic and summary lines report **aggregate** throughput across the `-n` conne
 
 ### 2d. Auto protocol selection (`-p auto`)
 
-Server listens on **multiple** reliable protocols using a fixed port map derived from the base port in `-l`. Client probes each candidate for `-probe-t` seconds (default 2), measuring **write** throughput after optional `-warmup`, prints a comparison table, then runs the full test (`-t`/`-n`/`-unit`/…) on the winner at the matching mapped port.
+Server listens on **multiple** reliable protocols using a fixed port map derived from the base port in `-l`. The client performs `-probe-rounds` upload probes per candidate (default **3**), visiting every protocol once in a fresh randomized order each round. Each sends for `-probe-t` seconds (default 2) plus optional `-warmup`. Selection ranks the **median receiver-verified goodput**, never buffered client writes. The winner then runs the ordinary full test (`-t`/`-n`/`-unit`/…) at its mapped port.
+
+Probe details and compatibility:
+
+- Both endpoints must run the new **auto wire v2**. Older auto peers and direct single-protocol clients on auto listeners are intentionally incompatible: missing/invalid reports fail the sample, with **no sender-throughput fallback**. Ordinary single-protocol `-p tcp|rudp|…` wire behavior is unchanged.
+- The base **TCP port must be reachable for every candidate**, including UDP/ICMP/DNS candidates. It carries bounded, fixed-size setup/progress/report controls; a random single-use 128-bit token binds each data connection. At most 128 control sessions are registered. With `-maxconn`, allow at least **2** on the TCP listener (control + TCP data); the limit applies per listener, including control connections.
+- Server checks each complete frame's sequence and deterministic payload. Goodput = verified payload bytes / server-monotonic elapsed time. The window starts immediately before receiver READY and ends after END is consumed, minus warmup. Frames whose read began before the warmup cutoff are excluded entirely; framing/control bytes are excluded. **Drain time is included**, never clamped to the requested sending duration. This prevents queued writes from inflating bandwidth.
+- Probe payload size is `-buf` (**16 bytes..1 MiB**); `-probe-t` is **1..60 seconds**, auto warmup **0..60 seconds**. A progress ACK every at most **1 MiB** bounds outstanding application data on every transport. This is single-stream upload goodput for that bounded window, **not unlimited-window line capacity** (high-BDP links can be window-limited). Full tests keep their existing payload/direction/connection settings and do not use probe framing.
+- Table shows median and valid/total rounds; each sample exposes verified bytes, measured duration, receiver bytes/s and validity/error. A strict majority of configured rounds must succeed; median averages the two middle valid samples when even. Exact ties prefer documented protocol order. Failed/zero-byte, malformed, mismatched or missing reports and incomplete cleanup are invalid; if no protocol qualifies, return an error and do not start a full test.
+- DNS resolution/dial is bounded by 3 seconds; each session has an overall budget of sending + warmup + 9 seconds (including setup, progress, drain, report and cleanup). Cancellation closes and joins probe IO/watchers. The server reports cleanup complete only **after closing/joining the data connection**, before the next probe. Auto QUIC uses fresh owned sessions with both read/write canceled on close, avoiding gohome's cached sessions/write-only stream Close. Non-auto QUIC is unchanged.
+- Probes always measure **upload**, even when the full run is read-only or bidirectional. They require no server `-write` and do not mix benchmark traffic with probing. Remote reports assume a trusted peer; deterministic validation is not authentication. Opt-in RDNS/RICMP still need their environment/privileges and can fail without disqualifying other candidates.
 
 **Port map** (base port `P` from `-l` / `-s`):
 
@@ -189,10 +201,10 @@ Server listens on **multiple** reliable protocols using a fixed port map derived
 ./connperf -l :8888 -p auto -read
 
 # Client: probe each protocol, print table, then full 30s run on the winner
-./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -t 30
+./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-rounds 3 -t 30
 
 # Probe only (no full run)
-./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-only
+./connperf -s 127.0.0.1:8888 -p auto -write -probe-t 2 -probe-rounds 3 -probe-only
 ```
 
 Open firewall ports `P` through `P+5` (and ICMP if using `-auto-ricmp`). Ensure nothing else binds those derived ports.
